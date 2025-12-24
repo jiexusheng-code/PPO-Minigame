@@ -25,7 +25,8 @@ class PySC2GymEnv(gym.Env):
         self.observation_space = gym.spaces.Box(low=0, high=1, shape=(84, 84, 3), dtype=np.float32)
         self.action_space = gym.spaces.Discrete(8)
 
-    def reset(self) -> tuple:
+    def reset(self, **kwargs) -> tuple:
+        # Accept seed and other kwargs from VecEnv/Monitor compatibility.
         # TODO: 调用 pysc2 的 reset 并返回处理后的 observation
         # Gymnasium: return observation, info
         obs = self.observation_space.sample()
