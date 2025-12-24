@@ -1,0 +1,61 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+eggs/
+*.egg-info/
+*.egg
+
+# Virtual environments
+venv/
+env/
+.venv/
+ENV/
+env.bak/
+
+# IDEs and editors
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment variables
+.env
+.venv
+env.local
+
+# Data, models and checkpoints
+data/
+datasets/
+models/
+checkpoints/
+*.ckpt
+*.pth
+
+# Logs and reports
+*.log
+logs/
+reports/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# OneDrive / temporary files
+~$*
+*.tmp
+
+# Sensitive files
+secrets.json
+credentials/
+
+# Large files (use Git LFS if needed)
+# *.bin
+# *.zip
