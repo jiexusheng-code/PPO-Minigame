@@ -2,15 +2,12 @@
 
 行为：
 - 不对动作/观测做任务特化；按 PySC2 提供的接口动态构建 observation_space，并给出可用动作列表。
-- 动作接收三种形式：
-  1) int：解释为 function_id；若该 function 需要参数或当前不可用，则退化为 no_op。
-  2) tuple(function_id, args)：直接传递（需用户保证与 action_spec 一致）。
-  3) dict{"function_id": id, "args": args}：同上。
+- 动作形式固定为 dict：{"function_id": fn_id, "args": args}；若不可用或参数非法则回退 no_op。
 - reset/step 使用 Gymnasium 返回格式：(obs, info) 与 (obs, reward, terminated, truncated, info)。
 
 说明：这是通用包装器，未假设具体 minigame；真实训练前应根据任务调整 observation 处理与动作编码。
 """
-from typing import Dict
+from typing import Any, Dict
 
 import gymnasium as gym
 import numpy as np
@@ -124,17 +121,11 @@ class PySC2GymEnv(gym.Env):
         return obs_dict, info
 
     def _unwrap_action(self, action):
-        # 支持 int / tuple / dict 形式
-        if isinstance(action, int):
-            fn_id = action
-            args = []
-        elif isinstance(action, tuple) and len(action) == 2:
-            fn_id, args = action
-        elif isinstance(action, dict):
-            fn_id = action.get("function_id")
-            args = action.get("args", [])
-        else:
-            raise ValueError("action 必须是 int、(function_id, args) 或 {'function_id', 'args'} 形式")
+        # 固定动作格式：dict{"function_id": fn_id, "args": args}
+        if not isinstance(action, dict):
+            raise ValueError("action 必须是 dict，包含 function_id 与 args")
+        fn_id = action.get("function_id")
+        args = action.get("args", [])
         return fn_id, args
 
     def step(self, action) -> tuple:
