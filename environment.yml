@@ -1,0 +1,19 @@
+name: minigame
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - pip:
+    - stable-baselines3
+    - sb3-contrib
+    - gym
+    - torch
+    - pysc2
+    - protobuf
+    - absl-py
+    - opencv-python
+    - tensorboard
+    - matplotlib

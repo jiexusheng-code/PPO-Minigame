@@ -1,0 +1,12 @@
+# Requirements for developing and running the minigame PPO experiments
+stable-baselines3
+sb3-contrib
+gym
+torch
+pysc2
+protobuf
+absl-py
+opencv-python
+tensorboard
+matplotlib
+numpy

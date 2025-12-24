@@ -1,0 +1,9 @@
+policy: CnnPolicy
+total_timesteps: 100000
+learning_rate: 2.5e-4
+ent_coef: 0.01
+batch_size: 64
+n_epochs: 10
+gamma: 0.99
+gae_lambda: 0.95
+n_steps: 2048
