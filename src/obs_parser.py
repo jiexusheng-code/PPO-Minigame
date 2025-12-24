@@ -200,7 +200,14 @@ class ObsParser:
     def _encode_upgrades(self, upgrades) -> np.ndarray:
         size = len(self.upgrade_vocab)
         vec = np.zeros(size, dtype=np.float16)
-        for up in upgrades or []:
+        if upgrades is None:
+            return vec
+        # 将 numpy array 转为 list，避免空 array 的 bool 语义错误
+        try:
+            upgrades_iter = upgrades.tolist() if hasattr(upgrades, "tolist") else list(upgrades)
+        except TypeError:
+            upgrades_iter = []
+        for up in upgrades_iter:
             idx = self.upgrade_vocab.get(up)
             if idx is None:
                 continue

@@ -1,4 +1,14 @@
-policy: CnnPolicy
+env: MoveToBeacon
+out_dir: ./models
+n_envs: 1
+seed: 0
+policy: MaskedFlattenPolicy
+policy_kwargs: {}
+env_kwargs:
+  screen_size: 64
+  minimap_size: 64
+  step_mul: 8
+  visualize: false
 total_timesteps: 100000
 learning_rate: 2.5e-4
 ent_coef: 0.01
