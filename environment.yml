@@ -9,7 +9,7 @@ dependencies:
   - pip:
     - stable-baselines3
     - sb3-contrib
-    - gym
+    - gymnasium
     - torch
     - pysc2
     - protobuf

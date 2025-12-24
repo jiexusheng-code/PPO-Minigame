@@ -3,7 +3,7 @@
 实现说明：PySC2 的接口与 Gym 不完全一致。这里放置一个最小的包装器骨架，后续需要根据选定的 observation / action 配置完善。
 """
 from typing import Any
-import gym
+import gymnasium as gym
 import numpy as np
 
 
@@ -25,17 +25,22 @@ class PySC2GymEnv(gym.Env):
         self.observation_space = gym.spaces.Box(low=0, high=1, shape=(84, 84, 3), dtype=np.float32)
         self.action_space = gym.spaces.Discrete(8)
 
-    def reset(self) -> Any:
+    def reset(self) -> tuple:
         # TODO: 调用 pysc2 的 reset 并返回处理后的 observation
-        return self.observation_space.sample()
+        # Gymnasium: return observation, info
+        obs = self.observation_space.sample()
+        info = {}
+        return obs, info
 
     def step(self, action) -> tuple:
-        # TODO: 将 action 转换为 pysc2 action，调用 env.step，并返回 (obs, reward, done, info)
+        # TODO: 将 action 转换为 pysc2 action，调用 env.step，并返回
+        # Gymnasium: (obs, reward, terminated, truncated, info)
         obs = self.observation_space.sample()
         reward = 0.0
-        done = False
+        terminated = False
+        truncated = False
         info = {}
-        return obs, reward, done, info
+        return obs, reward, terminated, truncated, info
 
     def render(self, mode="human"):
         pass

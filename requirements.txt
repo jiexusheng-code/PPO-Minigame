@@ -1,7 +1,7 @@
 # Requirements for developing and running the minigame PPO experiments
 stable-baselines3
 sb3-contrib
-gym
+gymnasium
 torch
 pysc2
 protobuf
