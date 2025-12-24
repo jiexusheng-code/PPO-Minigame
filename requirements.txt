@@ -1,12 +1,13 @@
 # Requirements for developing and running the minigame PPO experiments
-stable-baselines3
-sb3-contrib
-gymnasium
-torch
-pysc2
+# Pinning to avoid OpenMP/runtime conflicts and protobuf issues with pysc2
+stable-baselines3==2.3.0
+sb3-contrib==2.3.0
+gymnasium==0.29.1
+torch==2.2.2
+pysc2==3.0.0
 protobuf>=3.20,<4.0
 absl-py
-opencv-python
+opencv-python>=4.8.0
 tensorboard
 matplotlib
-numpy
+numpy<2.0

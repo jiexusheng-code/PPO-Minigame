@@ -1,19 +1,22 @@
 name: minigame
 channels:
   - conda-forge
+  - pytorch
   - defaults
 dependencies:
   - python=3.10
   - pip
-  - numpy
+  - numpy<2.0
+  - pytorch=2.2=*cpu*
+  - torchvision=0.17=*cpu*
+  - torchaudio=2.2=*cpu*
+  - gymnasium=0.29
+  - stable-baselines3=2.3
+  - sb3-contrib=2.3
+  - matplotlib
+  - tensorboard
+  - opencv
+  - absl-py
+  - protobuf>=3.20,<4.0
   - pip:
-    - stable-baselines3
-    - sb3-contrib
-    - gymnasium
-    - torch
-    - pysc2
-    - protobuf>=3.20,<4.0
-    - absl-py
-    - opencv-python
-    - tensorboard
-    - matplotlib
+    - pysc2==3.0.0
