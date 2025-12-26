@@ -38,7 +38,7 @@ class PySC2GymEnv(gym.Env):
             if not flags.FLAGS.is_parsed():
                 flags.FLAGS(["pysc2_env"])
         except Exception as exc:
-            raise RuntimeError("未找到 PySC2 依赖，请先安装并确保 StarCraft II 已正确安装与授权。") from exc
+            raise RuntimeError(f"无法导入 pysc2，请确保已正确安装。错误详情: {exc}") from exc
 
         self.sc2_env = sc2_env
         self.actions = actions
