@@ -1,9 +1,10 @@
 # Requirements for developing and running the minigame PPO experiments
-# Pinning to avoid OpenMP/runtime conflicts and protobuf issues with pysc2
+# Pins chosen to avoid OpenMP/runtime conflicts and stay compatible with pysc2/protobuf
 stable-baselines3==2.3.0
 sb3-contrib==2.3.0
 gymnasium==0.29.1
-torch==2.2.2
+# PyTorch packages are installed via conda (pytorch channel) for platform-specific wheels
+# Remove torch/torchvision/torchaudio from pip requirements to avoid missing-wheel errors
 pysc2==3.0.0
 protobuf>=3.20,<4.0
 absl-py
@@ -11,3 +12,4 @@ opencv-python>=4.8.0
 tensorboard
 matplotlib
 numpy<2.0
+pyyaml

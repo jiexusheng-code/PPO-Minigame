@@ -20,15 +20,17 @@ class MaskedFlattenPolicy(MultiInputPolicy):
         return torch.cat([func_logits, rest_logits], dim=1)
 
     def forward(self, obs, deterministic: bool = False):
-        features, _ = self.extract_features(obs)
-        latent_pi, latent_vf = self._get_latent(features)
+        # Assume SB3 2.2+ API: extract_features returns features; mlp_extractor produces actor/critic latents
+        features = self.extract_features(obs)
+        latent_pi, latent_vf = self.mlp_extractor(features)
         values = self.value_net(latent_vf)
         logits = self.action_net(latent_pi)
 
         if isinstance(self.action_dist, MultiCategoricalDistribution) and "action_mask" in obs:
             logits = self._apply_action_mask(logits, obs["action_mask"])
 
-        distribution = self._get_action_dist_from_latent(logits, latent_pi)
+        # For MultiCategorical, build distribution directly from masked logits (positional arg per SB3 2.3)
+        distribution = self.action_dist.proba_distribution(logits)
         actions = distribution.get_actions(deterministic=deterministic)
         log_prob = distribution.log_prob(actions)
         return actions, values, log_prob

@@ -128,7 +128,7 @@ class ObsParser:
             else:
                 print("ObsParser initialized without GPU support")
 
-    def parse_entities(self, obs: dict) -> dict:
+    def parse_entities(self, obs: Any) -> dict:
         """
         Process raw entity list into structured tensors:
           - type_ids: [N_max]
@@ -137,7 +137,16 @@ class ObsParser:
           - ent_mask: [N_max]
           - coords: [N_max, 2]
         """
-        units = obs.get("feature_units", [])
+        if isinstance(obs, dict):
+            if "feature_units" not in obs:
+                raise RuntimeError("observation dict missing feature_units")
+            units = obs["feature_units"]
+        elif hasattr(obs, "feature_units"):
+            units = getattr(obs, "feature_units")
+        elif hasattr(obs, "raw_data") and getattr(obs, "raw_data") is not None and hasattr(getattr(obs, "raw_data"), "units"):
+            units = getattr(getattr(obs, "raw_data"), "units")
+        else:
+            raise RuntimeError(f"unexpected observation type for entities: {type(obs)}; no feature_units/raw_data.units")
         N = min(len(units), self.N_max)
 
         type_ids = np.zeros(self.N_max, dtype=np.int64)
@@ -270,15 +279,26 @@ class ObsParser:
             dtype=np.float16,
         )
 
-    def _ui_summary(self, obs: dict) -> np.ndarray:
-        single_select = obs.get("single_select", []) 
-        multi_select = obs.get("multi_select", []) 
-        control_groups = obs.get("control_groups", []) 
-        alerts = obs.get("alerts", []) 
-        build_queue = obs.get("build_queue", []) 
-        production_queue = obs.get("production_queue", []) 
-        cargo = obs.get("cargo", []) 
-        last_actions = obs.get("last_actions", []) 
+    def _ui_summary(self, obs: Any) -> np.ndarray:
+        def _get(path, default=None):
+            cur = obs
+            for key in path:
+                if cur is None:
+                    return default
+                if isinstance(cur, dict):
+                    cur = cur.get(key)
+                else:
+                    cur = getattr(cur, key, None)
+            return cur if cur is not None else default
+
+        single_select = _get(["single_select"], [])
+        multi_select = _get(["multi_select"], [])
+        control_groups = _get(["control_groups"], [])
+        alerts = _get(["alerts"], [])
+        build_queue = _get(["build_queue"], [])
+        production_queue = _get(["production_queue"], [])
+        cargo = _get(["cargo"], [])
+        last_actions = _get(["last_actions"], [])
         filled_groups = 0
         for group in control_groups:
             try:
@@ -346,14 +366,40 @@ class ObsParser:
 
     def parse_scalar(self, obs: dict) -> dict:
         """Process global scalar data into vector and mask"""
-        map_id = self.map_name_vocab.get(obs.get("map_name", ""), 0)
-        upgrades_vec = self._encode_upgrades(obs.get("upgrades", []))
-        player_arr = np.asarray(obs.get("player", []), dtype=np.float16)
-        score_arr = np.log1p(
-            np.asarray(obs.get("score_cumulative", []), dtype=np.float32)
-        ).astype(np.float16)
-        loop_arr = np.array([obs.get("game_loop", 0)], dtype=np.float16) / 1e4
-        units = obs.get("feature_units", [])
+        def _get(path, default=None):
+            cur = obs
+            for key in path:
+                if cur is None:
+                    return default
+                if isinstance(cur, dict):
+                    cur = cur.get(key)
+                else:
+                    cur = getattr(cur, key, None)
+            return cur if cur is not None else default
+
+        map_name_val = _get(["map_name"], "")
+        map_id = self.map_name_vocab.get(map_name_val, 0)
+
+        upgrades_val = _get(["upgrades"], [])
+        upgrades_vec = self._encode_upgrades(upgrades_val)
+
+        player_val = _get(["player"], _get(["player_common"], []))
+        player_arr = np.asarray(player_val, dtype=np.float16)
+
+        score_val = _get(["score_cumulative"], _get(["score", "score_cumulative"], []))
+        score_arr = np.log1p(np.asarray(score_val, dtype=np.float32)).astype(np.float16)
+
+        loop_val = _get(["game_loop"], 0)
+        loop_arr = np.array([loop_val], dtype=np.float16) / 1e4
+
+        units_raw = _get(["feature_units"], _get(["raw_data", "units"], None))
+        if units_raw is None:
+            units = []
+        else:
+            try:
+                units = units_raw.tolist() if hasattr(units_raw, "tolist") else list(units_raw)
+            except TypeError:
+                units = []
 
         unit_summary = self._unit_summary(units)
         ui_summary = self._ui_summary(obs)
@@ -588,12 +634,59 @@ class ObsParser:
         mask = entity_dict["ent_mask"].reshape(N, 1)
         return embeddings * mask
 
-    def process_observation(self, obs: dict) -> dict:
-        """Runs full pipeline for one observation"""
-        e = self.parse_entities(obs)
-        s = self.parse_scalar(obs)
+    def process_observation(self, obs: object) -> dict:
+        """
+        Runs full pipeline for one observation (minigame精简版)
+        只保留minigame相关观测字段，保证输出格式和形状不变。
+        """
+        # 兼容 dict 和对象属性两种访问方式，缺失直接报错
+        def extract_attr(obs, key):
+            # 1. 尝试 _asdict
+            if hasattr(obs, "_asdict"):
+                d = obs._asdict()
+                if key in d:
+                    return d[key]
+            # 2. 尝试 __dict__
+            if hasattr(obs, "__dict__"):
+                d = vars(obs)
+                if key in d:
+                    return d[key]
+            # 3. 尝试 keys()/__getitem__
+            if hasattr(obs, "keys") and callable(obs.keys):
+                try:
+                    if key in obs.keys():
+                        return obs[key]
+                except Exception:
+                    pass
+            # 4. 尝试 getattr
+            try:
+                return getattr(obs, key)
+            except Exception as e:
+                print(f"extract_attr调试: type={type(obs)}, dir={dir(obs)}")
+                try:
+                    print(f"vars: {vars(obs)}")
+                except Exception:
+                    pass
+                raise RuntimeError(f"Failed to extract '{key}' from observation. getattr error: {e}")
 
-        S_base = self._prepare_screen_layers(obs.get("screen_layers"))
+        obs_minigame = {
+            "feature_units": extract_attr(obs, "feature_units"),
+            "map_name": extract_attr(obs, "map_name"),
+            "upgrades": extract_attr(obs, "upgrades"),
+            "player": extract_attr(obs, "player"),
+            "score_cumulative": extract_attr(obs, "score_cumulative"),
+            "game_loop": extract_attr(obs, "game_loop"),
+            "feature_screen": extract_attr(obs, "feature_screen"),
+            "available_actions": extract_attr(obs, "available_actions"),
+        }
+
+        # 实体数据
+        e = self.parse_entities(obs_minigame)
+        # 标量数据
+        s = self.parse_scalar(obs_minigame)
+        # 空间融合数据（只用feature_screen）
+        screen_layers = obs_minigame["feature_screen"]
+        S_base = self._prepare_screen_layers(screen_layers)
         ent_embed = self.create_entity_embedding(e)
         E_grid = self.scatter_connections(e["coords"], ent_embed)
         vis = np.zeros((1, self.H, self.W), dtype=np.float32)
@@ -604,9 +697,20 @@ class ObsParser:
 
         # 动作掩码（基于 FUNCTIONS），供上层策略使用
         action_mask = np.zeros(self.action_vocab_size, dtype=np.float32)
-        for fn_id in obs.get("available_actions", []) or []:
-            if 0 <= int(fn_id) < self.action_vocab_size:
-                action_mask[int(fn_id)] = 1.0
+        avail = obs_minigame["available_actions"]
+        if avail is None:
+            raise RuntimeError("observation missing available_actions; ensure feature action space is enabled")
+        try:
+            avail_iter = np.asarray(avail).flatten().tolist()
+        except Exception:
+            avail_iter = list(avail) if avail is not None else []
+        for fn_id in avail_iter:
+            try:
+                idx = int(fn_id)
+            except Exception:
+                continue
+            if 0 <= idx < self.action_vocab_size:
+                action_mask[idx] = 1.0
 
         return {
             "entities": e,
@@ -617,71 +721,67 @@ class ObsParser:
 
 
 if __name__ == "__main__":
-    from types import SimpleNamespace
-
+    from absl import flags
+    flags.FLAGS(['run'])
     parser = ObsParser()
+    try:
+        from pysc2.env import sc2_env
+        from pysc2.lib import features
+    except ImportError as exc:
+        print(f"PySC2 import failed: {exc}. Install pysc2 and set SC2PATH to your game.")
+        exit(1)
 
-    marine = SimpleNamespace(
-        unit_type="Marine",
-        alliance=1,
-        health=35.0,
-        health_max=45.0,
-        energy=20.0,
-        energy_max=50.0,
-        build_progress=1.0,
-        is_visible=True,
-        is_selected=True,
-        x=25,
-        y=40,
-        orders=[{"ability_id": 1}],
-        assigned_harvesters=None,
-        ideal_harvesters=None,
-        weapon_cooldown=5.0,
-        cargo_space_taken=0,
-        is_structure=False,
-    )
-    depot = SimpleNamespace(
-        unit_type="SupplyDepot",
-        alliance=1,
-        health=300.0,
-        health_max=400.0,
-        energy=0.0,
-        energy_max=0.0,
-        build_progress=0.5,
-        is_visible=True,
-        is_selected=False,
-        x=80,
-        y=120,
-        orders=[],
-        assigned_harvesters=0,
-        ideal_harvesters=0,
-        weapon_cooldown=None,
-        cargo_space_taken=0,
-        is_structure=True,
-    )
+    def print_obs_fields(obs, label):
+        print(f"\n--- {label} ---")
+        print(f"type: {type(obs)}")
+        print(f"dir: {dir(obs)}")
+        try:
+            print(f"vars: {vars(obs)}")
+        except Exception:
+            print("vars: <not available>")
+        for key in [
+            "feature_units", "map_name", "upgrades", "player", "score_cumulative", "game_loop", "feature_screen", "available_actions"
+        ]:
+            if isinstance(obs, dict):
+                val = obs.get(key, None)
+                print(f"dict: {key}: type={type(val)} value={str(val)[:80]}")
+            else:
+                val = getattr(obs, key, None)
+                print(f"obj: {key}: type={type(val)} value={str(val)[:80]}")
 
-    raw_obs = {
-        "feature_units": [marine, depot],
-        "map_name": "AbyssalReef",
-        "upgrades": [101],
-        "available_actions": [0, 2, 5],
-        "player": [50, 0, 2, 500, 50, 10],
-        "score_cumulative": [100, 200, 50],
-        "game_loop": 1234,
-        "single_select": [(0, 0)],
-        "multi_select": [(0, 0), (1, 1)],
-        "control_groups": [(0, 5), (1, 3)],
-        "alerts": [1, 2],
-        "build_queue": [1],
-        "production_queue": [2, 3],
-        "cargo": [["Marine"], ["SCV"]],
-        "last_actions": [0, 2, 5],
-        "screen_layers": np.random.rand(3, 64, 64).astype(np.float32),
-    }
+    try:
+        with sc2_env.SC2Env(
+            map_name="MoveToBeacon",
+            players=[sc2_env.Agent(sc2_env.Race.terran)],
+            agent_interface_format=sc2_env.AgentInterfaceFormat(
+                feature_dimensions=features.Dimensions(screen=64, minimap=64),
+                use_feature_units=True,
+                action_space=sc2_env.ActionSpace.FEATURES,
+            ),
+            step_mul=8,
+            game_steps_per_episode=0,
+            visualize=False,
+        ) as env:
+            timestep = env.reset()[0]
+            obs_live = timestep.observation
+            print_obs_fields(obs_live, "obs_live (TimeStep.observation)")
+            # 尝试转为dict
+            if hasattr(obs_live, "_asdict"):
+                obs_dict = obs_live._asdict()
+                print_obs_fields(obs_dict, "obs_live._asdict()")
+            # 用 process_observation 前后对比
+            print("\n=== Running ObsParser.process_observation on minigame live data ===")
+            out_live = parser.process_observation(obs_live)
+            entities_live = out_live["entities"]
+            scalar_live = out_live["scalar"]
+            spatial_live = out_live["spatial_fused"]
+            action_mask_live = out_live["action_mask"]
 
-    out = parser.process_observation(raw_obs)
-    scalar_shape = out["scalar"]["scalar_vec"].shape
-    spatial_shape = out["spatial_fused"].shape
-    print("Processed entities:", out["entities"]["ent_feats"].shape)
-    print("Processed scalar:", scalar_shape, "(expect 256 dims)")
-    print("Spatial fused shape:", spatial_shape, f"(expect (20, {parser.H}, {parser.W}))")
+            print("entities ent_feats shape:", entities_live["ent_feats"].shape)
+            print("scalar_vec shape:", scalar_live["scalar_vec"].shape)
+            print("spatial_fused shape:", spatial_live.shape)
+            print("action_mask nonzero count:", int(action_mask_live.sum()))
+            print("action_mask indices set:", np.nonzero(action_mask_live)[0].tolist())
+    except Exception as exc:
+        print(f"Failed to collect or process live observation: {exc}")
+        print("Make sure StarCraft II is installed and SC2PATH points to the game root.")

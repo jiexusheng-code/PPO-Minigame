@@ -1,18 +1,11 @@
-"""PySC2 -> Gymnasium wrapper (generic, minimal assumptions).
-
-行为：
-- 不对动作/观测做任务特化；按 PySC2 提供的接口动态构建 observation_space，并给出可用动作列表。
-- 动作空间为 MultiDiscrete：[fn_id, arg1, arg2, ...]，仅支持此格式；参数维度自动覆盖所有函数的最大需求，若不可用或参数非法则回退/修正。
-- reset/step 使用 Gymnasium 返回格式：(obs, info) 与 (obs, reward, terminated, truncated, info)。
-
-说明：这是通用包装器，未假设具体 minigame；真实训练前应根据任务调整 observation 处理与动作编码。
-"""
+"""PySC2 -> Gymnasium minigame wrapper, 兼容精简ObsParser输出。"""
 from typing import Any, Dict, Optional
 
 import gymnasium as gym
 import numpy as np
 
 from src.obs_parser import ObsParser
+from pysc2.lib import features
 
 
 class PySC2GymEnv(gym.Env):
@@ -24,52 +17,50 @@ class PySC2GymEnv(gym.Env):
         self,
         map_name: str = None,
         screen_size: int = 64,
-        minimap_size: int = 64,
+        minimap_size: int = None,
         step_mul: int = 8,
         visualize: bool = False,
-    ):#__init__ 只存参数，不启动 SC2
+        debug_print: bool = True,
+    ):
         super().__init__()
         self.map_name = map_name
         self.screen_size = screen_size
-        self.minimap_size = minimap_size
+        self.minimap_size = minimap_size if minimap_size is not None else screen_size
         self.step_mul = step_mul
         self.visualize = visualize
+        self.debug_print = debug_print
+        self._step_count = 0  # 记录步数
 
         try:
             from pysc2.env import sc2_env
             from pysc2.lib import actions, features
             from absl import flags
-            # 处理 absl 未解析 flags 导致的异常
             if not flags.FLAGS.is_parsed():
                 flags.FLAGS(["pysc2_env"])
-        except Exception as exc:  # pragma: no cover - import guard
+        except Exception as exc:
             raise RuntimeError("未找到 PySC2 依赖，请先安装并确保 StarCraft II 已正确安装与授权。") from exc
 
         self.sc2_env = sc2_env
         self.actions = actions
         self.features = features
-
-        # 观测预处理器（将原始 observation 转换为结构化张量）
         self._parser: ObsParser = ObsParser(H=self.screen_size, W=self.screen_size)
-
         self._env = None
-        self.observation_space = None  # type: ignore
-        self.action_space = None  # type: ignore
+        self.observation_space = None
+        self.action_space = None
         self._max_args = 0
+        self.timestep = None  # 维护当前timestep
         self._build_action_space()
-
-        # 为了兼容向量化环境，在构造时就确定 observation_space
         self._lazy_init()
         initial_ts = self._env.reset()
-        parsed = self._parser.process_observation(initial_ts[0].observation)
-        self._build_observation_space_from_parser(parsed)
+        self.timestep = initial_ts[0]
+        parsed = self._parser.process_observation(self.timestep.observation)
+        parsed_flat = self._flatten_parsed(parsed)
+        self._build_observation_space_from_parser(parsed_flat)
 
     def _build_action_space(self):
-        """构建 MultiDiscrete 动作空间：第一维是 function_id，后续为参数槽。"""
         n_funcs = len(self.actions.FUNCTIONS)
         max_args = 0
-        # 计算每个参数槽需要的最大取值范围
-        arg_sizes: list[int] = []
+        arg_sizes = []
         for fn in self.actions.FUNCTIONS:
             max_args = max(max_args, len(fn.args))
         for arg_idx in range(max_args):
@@ -79,10 +70,8 @@ class PySC2GymEnv(gym.Env):
                     continue
                 spec = fn.args[arg_idx]
                 name = getattr(spec, "name", "")
-                if "screen" in name:
+                if "screen" in name or "minimap" in name:
                     size = self.screen_size * self.screen_size
-                elif "minimap" in name:
-                    size = self.minimap_size * self.minimap_size
                 else:
                     size = int(spec.sizes[0]) if getattr(spec, "sizes", None) else 1
                 max_size = max(max_size, size)
@@ -91,70 +80,95 @@ class PySC2GymEnv(gym.Env):
         self.action_space = gym.spaces.MultiDiscrete([n_funcs] + arg_sizes)
 
     def _lazy_init(self):
-        """延迟初始化 SC2Env 实例"""
         if self._env is not None:
             return
-        dims = self.sc2_env.Dimensions(screen=(self.screen_size, self.screen_size), minimap=(self.minimap_size, self.minimap_size))
-        interface = self.sc2_env.AgentInterfaceFormat(feature_dimensions=dims, use_feature_units=False)
+        interface = self.sc2_env.AgentInterfaceFormat(
+            feature_dimensions=features.Dimensions(screen=self.screen_size, minimap=self.minimap_size),
+            use_feature_units=True,
+            action_space=self.actions.ActionSpace.FEATURES,
+            use_raw_actions=False,
+        )
+        # 与obs_parser.py测试代码保持一致，显式设置game_steps_per_episode=0
         self._env = self.sc2_env.SC2Env(
             map_name=self.map_name,
             players=[self.sc2_env.Agent(self.sc2_env.Race.terran)],
             agent_interface_format=interface,
             step_mul=self.step_mul,
+            game_steps_per_episode=0,
             visualize=self.visualize,
+            ensure_available_actions=True
         )
 
     def _build_observation_space_from_parser(self, parsed: Dict[str, object]):
-        """根据 ObsParser 输出构建 Gymnasium Dict 空间。"""
         spaces: Dict[str, gym.Space] = {}
-
-        # spatial_fused: (C, H, W)
         spatial = parsed.get("spatial_fused")
         if spatial is not None:
             c, h, w = spatial.shape
             spaces["spatial_fused"] = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(c, h, w), dtype=np.float32)
-
-        # scalar: {scalar_vec, scalar_mask}
-        scalar = parsed.get("scalar", {})
-        if scalar:
-            vec = scalar.get("scalar_vec")
-            mask = scalar.get("scalar_mask")
-            if vec is not None:
-                spaces["scalar_vec"] = gym.spaces.Box(low=-np.inf, high=np.inf, shape=vec.shape, dtype=vec.dtype)
-            if mask is not None:
-                spaces["scalar_mask"] = gym.spaces.Box(low=0.0, high=1.0, shape=mask.shape, dtype=mask.dtype)
-
-        # entities: fixed sizes based on parser.N_max
-        entities = parsed.get("entities", {})
+        scalar = parsed.get("scalar", {}) if isinstance(parsed.get("scalar", {}), dict) else {}
+        if "scalar_vec" in scalar:
+            vec = scalar["scalar_vec"]
+            spaces["scalar_vec"] = gym.spaces.Box(low=-np.inf, high=np.inf, shape=vec.shape, dtype=vec.dtype)
+        if "scalar_mask" in scalar:
+            mask = scalar["scalar_mask"]
+            spaces["scalar_mask"] = gym.spaces.Box(low=0.0, high=1.0, shape=mask.shape, dtype=mask.dtype)
+        entities = parsed.get("entities", {}) if isinstance(parsed.get("entities", {}), dict) else {}
         if entities:
-            N = getattr(self._parser, "N_max", 512) if self._parser is not None else 512
+            N = getattr(self._parser, "N_max", 512)
             spaces["type_ids"] = gym.spaces.Box(low=0, high=1e6, shape=(N,), dtype=np.int64)
             spaces["owner_ids"] = gym.spaces.Box(low=0, high=10, shape=(N,), dtype=np.int64)
-            spaces["ent_feats"] = gym.spaces.Box(low=-np.inf, high=np.inf, shape=entities.get("ent_feats", np.zeros((N, 5))).shape, dtype=np.float32)
+            ent_feats_shape = entities.get("ent_feats", np.zeros((N, 5))).shape
+            spaces["ent_feats"] = gym.spaces.Box(low=-np.inf, high=np.inf, shape=ent_feats_shape, dtype=np.float32)
             spaces["ent_mask"] = gym.spaces.Box(low=0.0, high=1.0, shape=(N,), dtype=np.float32)
-            spaces["coords"] = gym.spaces.Box(low=0, high=max(self.screen_size, self.minimap_size), shape=(N, 2), dtype=np.int32)
-
-        # action_mask
+            spaces["coords"] = gym.spaces.Box(low=0, high=self.screen_size, shape=(N, 2), dtype=np.int32)
         action_mask = parsed.get("action_mask")
         if action_mask is not None:
             spaces["action_mask"] = gym.spaces.Box(low=0.0, high=1.0, shape=action_mask.shape, dtype=np.float32)
-
         self.observation_space = gym.spaces.Dict(spaces)
 
     def _obs_to_space(self, timestep) -> Dict[str, Any]:
         raw_obs = timestep.observation
-
+        #print("DEBUG: observation fields:", dir(raw_obs))
         parsed = self._parser.process_observation(raw_obs)
+        parsed_flat = self._flatten_parsed(parsed)
         if self.observation_space is None:
-            self._build_observation_space_from_parser(parsed)
-        return parsed
+            self._build_observation_space_from_parser(parsed_flat)
+        return parsed_flat
+
+    def _flatten_parsed(self, parsed: Dict[str, Any]) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        def _add(name: str, val: Any, dtype) -> None:
+            if val is None:
+                return
+            try:
+                out[name] = np.array(val, dtype=dtype, copy=False)
+            except Exception:
+                return
+        if "spatial_fused" in parsed:
+            _add("spatial_fused", parsed["spatial_fused"], np.float32)
+        scalar = parsed.get("scalar", {}) if isinstance(parsed.get("scalar", {}), dict) else {}
+        if "scalar_vec" in scalar:
+            _add("scalar_vec", scalar["scalar_vec"], np.float32)
+        if "scalar_mask" in scalar:
+            _add("scalar_mask", scalar["scalar_mask"], np.float32)
+        entities = parsed.get("entities", {}) if isinstance(parsed.get("entities", {}), dict) else {}
+        if entities:
+            _add("type_ids", entities.get("type_ids"), np.int64)
+            _add("owner_ids", entities.get("owner_ids"), np.int64)
+            _add("ent_feats", entities.get("ent_feats"), np.float32)
+            _add("ent_mask", entities.get("ent_mask"), np.float32)
+            _add("coords", entities.get("coords"), np.int32)
+        if "action_mask" in parsed:
+            _add("action_mask", parsed["action_mask"], np.float32)
+        return out
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
         if seed is not None:
             np.random.seed(seed)
         self._lazy_init()
         timesteps = self._env.reset()
-        obs_dict = self._obs_to_space(timesteps[0])
+        self.timestep = timesteps[0]
+        obs_dict = self._obs_to_space(self.timestep)
         info = {}
         return obs_dict, info
 
@@ -169,7 +183,6 @@ class PySC2GymEnv(gym.Env):
         return fn_id, raw_params
 
     def _sanitize_params(self, fn_id: int, raw_params: list) -> tuple[list, bool]:
-        """根据函数参数规格将 raw_params 解析为合法值，返回 (args, clipped_flag)。"""
         clipped = False
         fn_id = int(fn_id) if fn_id is not None else 0
         if fn_id < 0 or fn_id >= len(self.actions.FUNCTIONS):
@@ -185,35 +198,37 @@ class PySC2GymEnv(gym.Env):
             except Exception:
                 raw_int = 0
 
-            if "screen" in name:
+            if "screen" in name or "minimap" in name:
                 max_flat = self.screen_size * self.screen_size
-                flat = int(np.clip(raw_int, 0, max_flat - 1))
-                if flat != raw_int:
+                if not (0 <= raw_int < max_flat):
+                    flat = np.random.randint(0, max_flat)
                     clipped = True
+                else:
+                    flat = raw_int
                 y, x = divmod(flat, self.screen_size)
-                args.append([x, y])
-            elif "minimap" in name:
-                max_flat = self.minimap_size * self.minimap_size
-                flat = int(np.clip(raw_int, 0, max_flat - 1))
-                if flat != raw_int:
-                    clipped = True
-                y, x = divmod(flat, self.minimap_size)
                 args.append([x, y])
             else:
                 size = int(sizes[0]) if len(sizes) > 0 else 1
-                val = int(np.clip(raw_int, 0, max(size - 1, 0)))
-                if val != raw_int:
+                if not (0 <= raw_int < size):
+                    val = np.random.randint(0, max(size, 1))
                     clipped = True
+                else:
+                    val = raw_int
                 args.append([val])
-
         return args, clipped
 
     def step(self, action) -> tuple:
         assert self._env is not None, "Env not initialized; call reset first"
 
         fn_id, raw_params = self._unwrap_action(action)
-        ts = self._env._obs[0]
-        available = ts.observation.get("available_actions", [])
+        # 用self.timestep获取当前观测
+        obs_raw = self.timestep.observation
+        parsed_now = self._parser.process_observation(obs_raw)
+        parsed_flat_now = self._flatten_parsed(parsed_now)
+        action_mask = parsed_flat_now.get("action_mask")
+        if action_mask is None:
+            raise RuntimeError("action_mask missing; cannot determine available actions")
+        available = np.nonzero(np.asarray(action_mask).reshape(-1))[0].tolist()
 
         args, clipped = self._sanitize_params(fn_id, raw_params)
 
@@ -221,25 +236,36 @@ class PySC2GymEnv(gym.Env):
         if fn_id not in available:
             act = self.actions.FUNCTIONS.no_op()
             clipped = True
+            exec_fn_id = self.actions.FUNCTIONS.no_op.id
+            exec_args = []
         else:
             try:
                 act = self.actions.FUNCTIONS[fn_id](*args) if args else self.actions.FUNCTIONS[fn_id]()
+                exec_fn_id = fn_id
+                exec_args = args
             except Exception:
                 act = self.actions.FUNCTIONS.no_op()
                 clipped = True
+                exec_fn_id = self.actions.FUNCTIONS.no_op.id
+                exec_args = []
 
         timesteps = self._env.step([act])
-        ts = timesteps[0]
+        self.timestep = timesteps[0]  # 更新当前timestep
+        self._step_count += 1
 
-        obs = self._obs_to_space(ts)
-        reward = float(ts.reward)
-        terminated = bool(ts.last())
+        obs = self._obs_to_space(self.timestep)
+        reward = float(self.timestep.reward)
+        terminated = bool(self.timestep.last())
         truncated = False
         info = {"arg_clipped": clipped, "fn_available": fn_id in available}
+        if self.debug_print:
+            print(f"Step {self._step_count}")
+            print(f"  Agent raw action: fn_id={fn_id}, raw_params={raw_params}")
+            print(f"  Executed action: fn_id={exec_fn_id}, args={exec_args}")
+            print(f"  Available actions: {len(available)}, reward={reward:.3f}, terminated={terminated}, clipped={clipped}")
         return obs, reward, terminated, truncated, info
 
     def render(self, mode="human"):
-        # PySC2 内置可视化取决于 visualize 选项
         return None
 
     def close(self):
