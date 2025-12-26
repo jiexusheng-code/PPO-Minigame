@@ -70,11 +70,11 @@ class PySC2GymEnv(gym.Env):
                 if name not in param_semantics_set:
                     param_semantics.append(name)
                     param_semantics_set.add(name)
-                # 统计最大size
-                if "screen" in name  or "screen2" in name:
-                    size = self.screen_size * self.screen_size
-                elif "minimap" in name:
+                # 统计最大size，区分screen、screen2、minimap
+                if "minimap" in name:
                     size = self.minimap_size * self.minimap_size
+                elif "screen2" in nameo or "screen" in name:
+                    size = self.screen_size * self.screen_size
                 else:
                     size = int(spec.sizes[0]) if getattr(spec, "sizes", None) else 1
                 if name not in param_size_dict or size > param_size_dict[name]:
@@ -92,14 +92,7 @@ class PySC2GymEnv(gym.Env):
             self._fn_param_map[fn.id] = slot_indices
         self._max_args = len(param_semantics)
         self.action_space = gym.spaces.MultiDiscrete([n_funcs] + arg_sizes)
-        # 打印参数槽位分配表，便于调试
-        if self.debug_print:
-            print("[动作参数槽位分配表]")
-            for i, name in enumerate(param_semantics):
-                print(f"槽位{i}: {name}, size={param_size_dict[name]}")
-            print("[动作类型到槽位映射]")
-            for fn in self.actions.FUNCTIONS:
-                print(f"fn_id={fn.id}, name={fn.name}, 槽位索引={self._fn_param_map[fn.id]}")
+        
 
     def _lazy_init(self):
         if self._env is not None:
@@ -195,49 +188,56 @@ class PySC2GymEnv(gym.Env):
         return obs_dict, info
 
     def _unwrap_action(self, action):
-        # 仅支持 MultiDiscrete 输出 (fn_id, arg1, arg2, ...)
+        # 仅支持 MultiDiscrete 输出 (fn_id, param_vec)
         if not isinstance(action, (list, tuple, np.ndarray)):
             raise ValueError("action 必须是 MultiDiscrete 输出的序列")
         if len(action) == 0:
             return None, []
         fn_id = int(action[0])
-        raw_params = list(action[1:])
-        return fn_id, raw_params
+        param_vec = list(action[1:])
+        return fn_id, param_vec
 
-    def _sanitize_params(self, fn_id: int, raw_params: list) -> tuple[list, bool]:
-        clipped = False
-        fn_id = int(fn_id) if fn_id is not None else 0
-        if fn_id < 0 or fn_id >= len(self.actions.FUNCTIONS):
+    def _sanitize_params(self, fn_id: int, param_vec: list) -> tuple[list, bool]:
+        try:
+            fn_id = int(fn_id) if fn_id is not None else 0
+            if fn_id < 0 or fn_id >= len(self.actions.FUNCTIONS):
+                raise ValueError(f"非法fn_id: {fn_id}")
+            fn = self.actions.FUNCTIONS[fn_id]
+            slot_indices = self._fn_param_map.get(fn_id, [])
+            args = []
+            for idx, spec in enumerate(fn.args):
+                name = getattr(spec, "name", "")
+                sizes = getattr(spec, "sizes", []) or []
+                slot = slot_indices[idx] if idx < len(slot_indices) else None
+                if slot is None or slot >= len(param_vec):
+                    raise RuntimeError(f"参数槽位缺失: fn_id={fn_id}, 参数{name}, 槽位={slot}")
+                raw_val = param_vec[slot]
+                try:
+                    raw_int = int(raw_val)
+                except Exception:
+                    raise RuntimeError(f"参数类型错误: fn_id={fn_id}, 参数{name}, 槽位={slot}, raw_val={raw_val}")
+
+                if "minimap" in name:
+                    max_flat = self.minimap_size * self.minimap_size
+                    if not (0 <= raw_int < max_flat):
+                        raise ValueError(f"参数越界: fn_id={fn_id}, 参数{name}, 槽位={slot}, raw_val={raw_val}")
+                    y, x = divmod(raw_int, self.minimap_size)
+                    args.append([x, y])
+                elif "screen" in name or "screen2" in name:
+                    max_flat = self.screen_size * self.screen_size
+                    if not (0 <= raw_int < max_flat):
+                        raise ValueError(f"参数越界: fn_id={fn_id}, 参数{name}, 槽位={slot}, raw_val={raw_val}")
+                    y, x = divmod(raw_int, self.screen_size)
+                    args.append([x, y])
+                else:
+                    size = int(sizes[0]) if len(sizes) > 0 else 1
+                    if not (0 <= raw_int < size):
+                        raise ValueError(f"参数越界: fn_id={fn_id}, 参数{name}, 槽位={slot}, raw_val={raw_val}")
+                    args.append([raw_int])
+            return args, False
+        except Exception as e:
+            print(f"[参数异常] {e}, fn_id={fn_id}, param_vec={param_vec}, 使用 no_op 回退")
             return [], True
-        fn = self.actions.FUNCTIONS[fn_id]
-        args = []
-        for idx, spec in enumerate(fn.args):
-            name = getattr(spec, "name", "")
-            sizes = getattr(spec, "sizes", []) or []
-            raw_val = raw_params[idx] if idx < len(raw_params) else 0
-            try:
-                raw_int = int(raw_val)
-            except Exception:
-                raw_int = 0
-
-            if "screen" in name or "minimap" in name:
-                max_flat = self.screen_size * self.screen_size
-                if not (0 <= raw_int < max_flat):
-                    flat = np.random.randint(0, max_flat)
-                    clipped = True
-                else:
-                    flat = raw_int
-                y, x = divmod(flat, self.screen_size)
-                args.append([x, y])
-            else:
-                size = int(sizes[0]) if len(sizes) > 0 else 1
-                if not (0 <= raw_int < size):
-                    val = np.random.randint(0, max(size, 1))
-                    clipped = True
-                else:
-                    val = raw_int
-                args.append([val])
-        return args, clipped
 
     def step(self, action) -> tuple:
         assert self._env is not None, "Env not initialized; call reset first"
@@ -254,22 +254,16 @@ class PySC2GymEnv(gym.Env):
 
         args, clipped = self._sanitize_params(fn_id, raw_params)
 
-        # 如果不可用则回退 no_op
-        if fn_id not in available:
+        try:
+            act = self.actions.FUNCTIONS[fn_id](*args) if args else self.actions.FUNCTIONS[fn_id]()
+            exec_fn_id = fn_id
+            exec_args = args
+        except Exception as e:
             act = self.actions.FUNCTIONS.no_op()
             clipped = True
             exec_fn_id = self.actions.FUNCTIONS.no_op.id
             exec_args = []
-        else:
-            try:
-                act = self.actions.FUNCTIONS[fn_id](*args) if args else self.actions.FUNCTIONS[fn_id]()
-                exec_fn_id = fn_id
-                exec_args = args
-            except Exception:
-                act = self.actions.FUNCTIONS.no_op()
-                clipped = True
-                exec_fn_id = self.actions.FUNCTIONS.no_op.id
-                exec_args = []
+            print(f"[执行动作异常] {e}, fn_id={fn_id}, args={args}, 使用 no_op 回退")
 
         timesteps = self._env.step([act])
         self.timestep = timesteps[0]  # 更新当前timestep
