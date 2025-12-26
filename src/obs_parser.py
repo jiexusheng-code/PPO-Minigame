@@ -8,40 +8,13 @@ import time
 import logging
 from typing import Dict, Optional, Any
 
-# 日志配置：与主程序保持一致，归档到统一目录
-logger = logging.getLogger("rl.obs_parser")
-
-
-# GPU支持初始化
-def init_gpu():
-    try:
-        import cupy as cp
-        if cp.cuda.is_available():
-            device = cp.cuda.get_device_id()
-            cp.cuda.Device(device).use()
-            logger.info(f"GPU computation enabled - Using CUDA device {device}")
-            logger.info(f"Device name: {cp.cuda.runtime.getDeviceProperties(device)['name'].decode()}")
-            return cp, True
-        else:
-            logger.info("No CUDA device available")
-            return None, False
-    except ImportError as e:
-        logger.warning(f"无法导入cupy: {str(e)}")
-        return None, False
-    except Exception as e:
-        logger.error(f"GPU初始化失败: {str(e)}")
-        return None, False
-
-
-cp, USE_GPU = init_gpu()
-
-
 from pysc2.lib import actions as sc2_actions
 from pysc2.lib import units as sc2_units
 from pysc2.lib import upgrades as sc2_upgrades
 from pysc2 import maps as sc2_maps
 
-
+# 日志配置：与主程序保持一致，归档到统一目录
+logger = logging.getLogger("rl.obs_parser")
 
 def _default_unit_type_vocab() -> Dict[int, int]:
     if sc2_units is None:
@@ -105,24 +78,12 @@ class ObsParser:
         self.action_vocab_size = (
             action_vocab_size if action_vocab_size is not None else _default_action_vocab_size()
         )
-        if not self.unit_type_vocab:
-            raise ValueError("unit_type_vocab is empty; please provide a custom mapping or ensure pysc2 is available")
-        if not self.map_name_vocab:
-            raise ValueError("map_name_vocab is empty; please provide map mappings or ensure pysc2 maps can be discovered")
-        if not self.upgrade_vocab:
-            raise ValueError("upgrade_vocab is empty; please supply upgrade mappings or enable pysc2")
-        if self.action_vocab_size <= 0:
-            raise ValueError("action_vocab_size must be positive; provide a value or install pysc2 for RAW_FUNCTIONS")
         self.H = H
         self.W = W
         self.N_max = N_max
 
-        # 用init_gpu()返回的cp和USE_GPU判断GPU状态，移除对CUPY的依赖
-        self._gpu_initialized = USE_GPU and (cp is not None)
-        if self._gpu_initialized:
-            logger.info(f"ObsParser initialized with GPU support, CUDA device: {cp.cuda.get_device_id()}")
-        else:
-            logger.info("ObsParser initialized without GPU support")
+        # 仅使用CPU，无需GPU相关逻辑
+        logger.info("ObsParser initialized (CPU only)")
 
     def parse_entities(self, obs: Any) -> dict:
         """
@@ -339,23 +300,10 @@ class ObsParser:
             or getattr(self, "_scalar_proj_dim", None) != target_dim
         )
         if need_new:
-            if USE_GPU and self._gpu_initialized and cp is not None:
-                try:
-                    projection = cp.random.randn(input_dim, target_dim).astype(np.float32)
-                    q, _ = cp.linalg.qr(projection)
-                    self.scalar_projection = (q * cp.sqrt(1.0 / input_dim)).astype(np.float16)
-                    self._scalar_projection_backend = "gpu"
-                except Exception:
-                    self._gpu_initialized = False
-                    projection_np = np.random.randn(input_dim, target_dim).astype(np.float32)
-                    q_np, _ = np.linalg.qr(projection_np)
-                    self.scalar_projection = (q_np * np.sqrt(1.0 / input_dim)).astype(np.float16)
-                    self._scalar_projection_backend = "cpu"
-            else:
-                projection_np = np.random.randn(input_dim, target_dim).astype(np.float32)
-                q_np, _ = np.linalg.qr(projection_np)
-                self.scalar_projection = (q_np * np.sqrt(1.0 / input_dim)).astype(np.float16)
-                self._scalar_projection_backend = "cpu"
+            projection_np = np.random.randn(input_dim, target_dim).astype(np.float32)
+            q_np, _ = np.linalg.qr(projection_np)
+            self.scalar_projection = (q_np * np.sqrt(1.0 / input_dim)).astype(np.float16)
+            self._scalar_projection_backend = "cpu"
             self._scalar_proj_in_dim = input_dim
             self._scalar_proj_dim = target_dim
         return self.scalar_projection
@@ -423,34 +371,10 @@ class ObsParser:
         projection = self._ensure_scalar_projection(input_dim, target_dim)
         # logger.debug("=== 开始矩阵计算 ===")
         backend = getattr(self, "_scalar_projection_backend", "cpu")
-        if USE_GPU and self._gpu_initialized and backend == "gpu" and cp is not None:
-            try:
-                scalar_vec_gpu = cp.asarray(scalar_vec.astype(np.float32))
-                projection_gpu = cp.asarray(self.scalar_projection.astype(np.float32))
-                start_time = time.time()
-                result_gpu = cp.dot(scalar_vec_gpu, projection_gpu)
-                cp.cuda.stream.get_current_stream().synchronize()
-                gpu_time = (time.time() - start_time) * 1000
-                logger.debug(f"GPU计算完成 - 结果形状: {result_gpu.shape}, GPU计算时间: {gpu_time:.2f} ms")
-                scalar_vec = cp.asnumpy(result_gpu).astype(np.float16)
-                del scalar_vec_gpu, projection_gpu, result_gpu
-                cp.get_default_memory_pool().free_all_blocks()
-                logger.debug(f"GPU计算结果: shape={scalar_vec.shape}, range=[{scalar_vec.min():.3f}, {scalar_vec.max():.3f}]")
-            except Exception as e:
-                logger.warning(f"GPU computation failed: {str(e)}，Falling back to CPU computation...")
-                scalar_vec_f32 = scalar_vec.astype(np.float32)
-                if getattr(self, "_scalar_projection_backend", "cpu") == "gpu" and cp is not None:
-                    projection_f32 = cp.asnumpy(self.scalar_projection).astype(np.float32)
-                else:
-                    projection_f32 = self.scalar_projection.astype(np.float32)
-                scalar_vec = np.dot(scalar_vec_f32, projection_f32).astype(np.float16)
-        else:
-            scalar_vec_f32 = scalar_vec.astype(np.float32)
-            if getattr(self, "_scalar_projection_backend", "cpu") == "gpu" and cp is not None:
-                projection_f32 = cp.asnumpy(self.scalar_projection).astype(np.float32)
-            else:
-                projection_f32 = self.scalar_projection.astype(np.float32)
-            scalar_vec = np.dot(scalar_vec_f32, projection_f32).astype(np.float16)
+        # 仅使用CPU进行矩阵乘法
+        scalar_vec_f32 = scalar_vec.astype(np.float32)
+        projection_f32 = self.scalar_projection.astype(np.float32)
+        scalar_vec = np.dot(scalar_vec_f32, projection_f32).astype(np.float16)
 
         # logger.debug(f"Projected scalar_vec shape: {scalar_vec.shape}, dims: {scalar_vec.size}, range: {scalar_vec.min():.3f} to {scalar_vec.max():.3f}")
 

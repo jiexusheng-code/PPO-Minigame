@@ -63,6 +63,16 @@ def main():
     logger.info(f"环境名: {env_name}")
     logger.info(f"环境参数: {env_kwargs}")
     logger.info(f"训练配置: {cfg}")
+    # 记录PyTorch设备信息
+    try:
+        import torch
+        if torch.cuda.is_available():
+            device_str = f"cuda:{torch.cuda.current_device()} ({torch.cuda.get_device_name(torch.cuda.current_device())})"
+        else:
+            device_str = "cpu"
+        logger.info(f"PyTorch 当前设备: {device_str}")
+    except Exception as e:
+        logger.warning(f"无法检测PyTorch设备: {e}")
     checkpoint_path = cfg.get("checkpoint_path", None)
     if checkpoint_path and os.path.isfile(checkpoint_path):
         logger.info(f"[INFO] 从checkpoint加载模型: {checkpoint_path}")
