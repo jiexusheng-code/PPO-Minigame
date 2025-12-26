@@ -32,21 +32,7 @@ class PySC2GymEnv(gym.Env):
         self.debug_print = debug_print
         self._step_count = 0  # 记录步数
 
-        # 日志设置，与train.py保持一致，粒度到小时
-        today_str = datetime.datetime.now().strftime("%Y%m%d%H")
-        base_dir = os.path.join("models", today_str)
-        log_dir = os.path.join(base_dir, "logs")
-        if not os.path.exists(log_dir):
-            os.makedirs(log_dir, exist_ok=True)
-        log_path = os.path.join(log_dir, f"env_{today_str}.log")
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s %(levelname)s %(message)s',
-            handlers=[
-                logging.FileHandler(log_path, encoding='utf-8'),
-                logging.StreamHandler()
-            ]
-        )
+        # 日志设置：只用主进程的logging.basicConfig，所有模块共用同一日志文件
         self.logger = logging.getLogger("PySC2GymEnv")
 
         try:

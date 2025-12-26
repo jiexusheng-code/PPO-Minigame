@@ -1,37 +1,35 @@
+"""
+这份环境解析器是针对PYSC2中的minigame环境的，故在选取环境信息时做了简化处理。
+"""
+
 import numpy as np
 import cv2
 import time
+import logging
 from typing import Dict, Optional, Any
 
-DEBUG = False  # 调试开关
+# 日志配置：与主程序保持一致，归档到统一目录
+logger = logging.getLogger("rl.obs_parser")
 
 
 # GPU支持初始化
 def init_gpu():
     try:
         import cupy as cp
-
-        # 尝试初始化GPU并选择设备
         if cp.cuda.is_available():
             device = cp.cuda.get_device_id()
             cp.cuda.Device(device).use()
-            if DEBUG:
-                print(f"\nGPU computation enabled - Using CUDA device {device}")
-                print(
-                    f"Device name: {cp.cuda.runtime.getDeviceProperties(device)['name'].decode()}"
-                )
+            logger.info(f"GPU computation enabled - Using CUDA device {device}")
+            logger.info(f"Device name: {cp.cuda.runtime.getDeviceProperties(device)['name'].decode()}")
             return cp, True
         else:
-            if DEBUG:
-                print("\nNo CUDA device available")
+            logger.info("No CUDA device available")
             return None, False
     except ImportError as e:
-        if DEBUG:
-            print(f"\n无法导入cupy: {str(e)}")
+        logger.warning(f"无法导入cupy: {str(e)}")
         return None, False
     except Exception as e:
-        if DEBUG:
-            print(f"\nGPU初始化失败: {str(e)}")
+        logger.error(f"GPU初始化失败: {str(e)}")
         return None, False
 
 
@@ -121,12 +119,10 @@ class ObsParser:
 
         # 用init_gpu()返回的cp和USE_GPU判断GPU状态，移除对CUPY的依赖
         self._gpu_initialized = USE_GPU and (cp is not None)
-        if DEBUG:
-            if self._gpu_initialized:
-                print(f"ObsParser initialized with GPU support")
-                print(f"Using CUDA device: {cp.cuda.get_device_id()}")
-            else:
-                print("ObsParser initialized without GPU support")
+        if self._gpu_initialized:
+            logger.info(f"ObsParser initialized with GPU support, CUDA device: {cp.cuda.get_device_id()}")
+        else:
+            logger.info("ObsParser initialized without GPU support")
 
     def parse_entities(self, obs: Any) -> dict:
         """
@@ -413,90 +409,35 @@ class ObsParser:
             ui_summary,
         ]
 
-        if DEBUG:
-            print("\nScalar vector components dimensions:")
-            names = [
-                "map_id",
-                "upgrades_vec",
-                "player_arr",
-                "score_arr",
-                "loop_arr",
-                "unit_summary",
-                "ui_summary",
-                "effects_summary",
-                "map_state_summary",
-            ]
-            for comp, name in zip(scalar_components, names):
-                print(f"{name}: {comp.size} dims")
+        # 可选：如需详细调试可用logger.debug
+        # logger.debug(f"Scalar vector components: {[comp.size for comp in scalar_components]}")
 
         scalar_vec = (
             np.concatenate([comp.flatten() for comp in scalar_components]).astype(np.float16)
         )
-        if DEBUG:
-            print(f"\nOriginal scalar_vec shape: {scalar_vec.shape}")
-            print(f"Original dimensions: {scalar_vec.size}")
-
-            # 检查GPU状态
-            print(f"\nGPU Status:")
-            print(f"USE_GPU: {USE_GPU}")
-            print(
-                f"_gpu_initialized: {hasattr(self, '_gpu_initialized')} {getattr(self, '_gpu_initialized', False)}"
-            )
+        # logger.debug(f"Original scalar_vec shape: {scalar_vec.shape}, dims: {scalar_vec.size}")
 
         # 添加线性映射到256维
         target_dim = 256
         input_dim = scalar_vec.size
         projection = self._ensure_scalar_projection(input_dim, target_dim)
-        if DEBUG:
-            print("\n=== 开始矩阵计算 ===")
+        # logger.debug("=== 开始矩阵计算 ===")
         backend = getattr(self, "_scalar_projection_backend", "cpu")
         if USE_GPU and self._gpu_initialized and backend == "gpu" and cp is not None:
-            if DEBUG:
-                print("使用GPU进行计算...")
             try:
-                if DEBUG:
-                    print("\n正在进行GPU矩阵乘法...")
-                    print(f"输入向量形状: {scalar_vec.shape}")
-                    print(f"投影矩阵形状: {self.scalar_projection.shape}")
-
-                    # 将数据转移到GPU
-                    print("传输数据到GPU...")
                 scalar_vec_gpu = cp.asarray(scalar_vec.astype(np.float32))
                 projection_gpu = cp.asarray(self.scalar_projection.astype(np.float32))
-                if DEBUG:
-                    print(
-                        f"数据已传输到GPU - 形状: {scalar_vec_gpu.shape}, {projection_gpu.shape}"
-                    )
-
-                # 在GPU上进行矩阵乘法并计时
                 start_time = time.time()
                 result_gpu = cp.dot(scalar_vec_gpu, projection_gpu)
                 cp.cuda.stream.get_current_stream().synchronize()
-                gpu_time = (time.time() - start_time) * 1000  # 转换为毫秒
-
-                if DEBUG:
-                    print(f"GPU计算完成 - 结果形状: {result_gpu.shape}")
-                    print(f"GPU计算时间: {gpu_time:.2f} ms")
-
-                    # 将结果传回CPU
-                    print("正在将结果传回CPU...")
+                gpu_time = (time.time() - start_time) * 1000
+                logger.debug(f"GPU计算完成 - 结果形状: {result_gpu.shape}, GPU计算时间: {gpu_time:.2f} ms")
                 scalar_vec = cp.asnumpy(result_gpu).astype(np.float16)
-
-                # 清理GPU内存
                 del scalar_vec_gpu, projection_gpu, result_gpu
                 cp.get_default_memory_pool().free_all_blocks()
-                if DEBUG:
-                    print("GPU内存已清理")
-
-                    print(f"\nGPU计算结果:")
-                    print(f"最终向量形状: {scalar_vec.shape}")
-                    print(f"数值范围: [{scalar_vec.min():.3f}, {scalar_vec.max():.3f}]")
+                logger.debug(f"GPU计算结果: shape={scalar_vec.shape}, range=[{scalar_vec.min():.3f}, {scalar_vec.max():.3f}]")
             except Exception as e:
-                # 修复重复except块的语法错误，只保留一个异常捕获
-                if DEBUG:
-                    print(f"GPU computation failed with error: {str(e)}")
-                    print("Falling back to CPU computation...")
-                # 回退到CPU计算
+                logger.warning(f"GPU computation failed: {str(e)}，Falling back to CPU computation...")
                 scalar_vec_f32 = scalar_vec.astype(np.float32)
                 if getattr(self, "_scalar_projection_backend", "cpu") == "gpu" and cp is not None:
                     projection_f32 = cp.asnumpy(self.scalar_projection).astype(np.float32)
@@ -504,9 +445,6 @@ class ObsParser:
                     projection_f32 = self.scalar_projection.astype(np.float32)
                 scalar_vec = np.dot(scalar_vec_f32, projection_f32).astype(np.float16)
         else:
-            # CPU计算
-            if DEBUG:
-                print("\nUsing CPU for matrix multiplication (GPU not available)")
             scalar_vec_f32 = scalar_vec.astype(np.float32)
             if getattr(self, "_scalar_projection_backend", "cpu") == "gpu" and cp is not None:
                 projection_f32 = cp.asnumpy(self.scalar_projection).astype(np.float32)
@@ -514,10 +452,7 @@ class ObsParser:
                 projection_f32 = self.scalar_projection.astype(np.float32)
             scalar_vec = np.dot(scalar_vec_f32, projection_f32).astype(np.float16)
 
-        if DEBUG:
-            print(f"Projected scalar_vec shape: {scalar_vec.shape}")
-            print(f"Final dimensions: {scalar_vec.size}")
-            print(f"Value range: {scalar_vec.min():.3f} to {scalar_vec.max():.3f}")
+        # logger.debug(f"Projected scalar_vec shape: {scalar_vec.shape}, dims: {scalar_vec.size}, range: {scalar_vec.min():.3f} to {scalar_vec.max():.3f}")
 
         scalar_mask = np.ones_like(scalar_vec, dtype=np.float16)
         return {"scalar_vec": scalar_vec.astype(np.float16), "scalar_mask": scalar_mask}
@@ -534,16 +469,11 @@ class ObsParser:
         self, coords: np.ndarray, ent_embed: np.ndarray, mode: str = "sum"
     ) -> np.ndarray:
         """Scatter entity embeddings onto spatial grid channels"""
-        if DEBUG:
-            print(f"scatter_connections input shapes:")
-            print(f"coords shape: {coords.shape}")
-            print(f"ent_embed shape: {ent_embed.shape}")
-            print(f"coords min/max: {coords.min()}, {coords.max()}")
+        # logger.debug(f"scatter_connections input shapes: coords={coords.shape}, ent_embed={ent_embed.shape}, coords min/max={coords.min()},{coords.max()}")
 
         C_e = ent_embed.shape[1]
         grid = np.zeros((C_e, self.H, self.W), dtype=np.float32)
-        if DEBUG:
-            print(f"grid shape: {grid.shape}")
+        # logger.debug(f"grid shape: {grid.shape}")
 
         try:
             for i, (x, y) in enumerate(coords):
@@ -551,10 +481,7 @@ class ObsParser:
                     isinstance(x, (int, np.integer))
                     and isinstance(y, (int, np.integer))
                 ):
-                    if DEBUG:
-                        print(
-                            f"Warning: Non-integer coordinates at index {i}: x={x} ({type(x)}), y={y} ({type(y)})"
-                        )
+                    logger.warning(f"Non-integer coordinates at index {i}: x={x} ({type(x)}), y={y} ({type(y)})")
                     x, y = int(x), int(y)
 
                 if 0 <= x < self.W and 0 <= y < self.H:
@@ -563,28 +490,16 @@ class ObsParser:
                     else:
                         grid[:, y, x] = np.maximum(grid[:, y, x], ent_embed[i])
                 else:
-                    if DEBUG:
-                        print(
-                            f"Warning: Coordinates out of bounds at index {i}: x={x}, y={y}"
-                        )
+                    logger.warning(f"Coordinates out of bounds at index {i}: x={x}, y={y}")
 
             grid_sum = (grid**2).sum(axis=(1, 2), keepdims=True)
-            if DEBUG:
-                print(
-                    f"grid_sum shape: {grid_sum.shape}, min/max: {grid_sum.min()}, {grid_sum.max()}"
-                )
-
+            # logger.debug(f"grid_sum shape: {grid_sum.shape}, min/max: {grid_sum.min()}, {grid_sum.max()}")
             grid_norm = np.sqrt(grid_sum + 1e-8)
             grid = grid / grid_norm
-
-            if DEBUG:
-                print(f"Final grid shape: {grid.shape}")
+            # logger.debug(f"Final grid shape: {grid.shape}")
             return grid
-
         except Exception as e:
-            if DEBUG:
-                print(f"Error in scatter_connections: {str(e)}")
-                print(f"Error at coords index {i} if available")
+            logger.error(f"Error in scatter_connections: {str(e)} at coords index {i if 'i' in locals() else '?'}")
             raise
 
     def _prepare_screen_layers(self, layers: Optional[np.ndarray]) -> np.ndarray:
@@ -622,14 +537,11 @@ class ObsParser:
         )
         combined_features = combined_features.astype(np.float16)
         W = W.astype(np.float16)
-        if DEBUG:
-            print(f"combined_features shape: {combined_features.shape}")
-            print(f"W shape: {W.shape}")
+        # logger.debug(f"combined_features shape: {combined_features.shape}, W shape: {W.shape}")
         try:
             embeddings = np.matmul(combined_features, W)
         except Exception as e:
-            if DEBUG:
-                print(f"Error in create_entity_embedding: {str(e)}")
+            logger.error(f"Error in create_entity_embedding: {str(e)}")
             raise
         mask = entity_dict["ent_mask"].reshape(N, 1)
         return embeddings * mask
@@ -662,9 +574,10 @@ class ObsParser:
             try:
                 return getattr(obs, key)
             except Exception as e:
-                print(f"extract_attr调试: type={type(obs)}, dir={dir(obs)}")
+                logger.error(f"Failed to extract '{key}' from observation: {e}")
+                logger.debug(f"extract_attr调试: type={type(obs)}, dir={dir(obs)}")
                 try:
-                    print(f"vars: {vars(obs)}")
+                    logger.debug(f"vars: {vars(obs)}")
                 except Exception:
                     pass
                 raise RuntimeError(f"Failed to extract '{key}' from observation. getattr error: {e}")
