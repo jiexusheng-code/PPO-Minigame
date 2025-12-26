@@ -73,7 +73,7 @@ class PySC2GymEnv(gym.Env):
                 # 统计最大size，区分screen、screen2、minimap
                 if "minimap" in name:
                     size = self.minimap_size * self.minimap_size
-                elif "screen2" in nameo or "screen" in name:
+                elif "screen2" in name or "screen" in name:
                     size = self.screen_size * self.screen_size
                 else:
                     size = int(spec.sizes[0]) if getattr(spec, "sizes", None) else 1
