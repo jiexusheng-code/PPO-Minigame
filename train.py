@@ -37,6 +37,8 @@ def main():
     ppo_kwargs = {k: cfg[k] for k in ppo_param_keys if k in cfg}
     env_fn = make_env_fn(env_name, env_kwargs)
     vec_env = make_vec_env(env_fn, n_envs=n_envs, seed=seed, wrapper_class=Monitor)
+    import datetime
+    today_str = datetime.datetime.now().strftime("%Y%m%d")
     tb_log = os.path.join(out_dir, "tb_logs")
     checkpoint_path = cfg.get("checkpoint_path", None)
     if checkpoint_path and os.path.isfile(checkpoint_path):
@@ -44,9 +46,10 @@ def main():
         model = PPO.load(checkpoint_path, env=vec_env, tensorboard_log=tb_log, policy=policy, policy_kwargs=policy_kwargs, **ppo_kwargs)
     else:
         model = PPO(policy, vec_env, verbose=1, tensorboard_log=tb_log, policy_kwargs=policy_kwargs, **ppo_kwargs)
-    checkpoint_cb = CheckpointCallback(save_freq=10000, save_path=out_dir, name_prefix="ppo_sc2")
+    checkpoint_prefix = f"ppo_sc2_{today_str}"
+    checkpoint_cb = CheckpointCallback(save_freq=10000, save_path=out_dir, name_prefix=checkpoint_prefix)
     model.learn(total_timesteps=total_timesteps, callback=checkpoint_cb)
-    model.save(os.path.join(out_dir, "final_model"))
+    model.save(os.path.join(out_dir, f"final_model_{today_str}"))
     with open(os.path.join(out_dir, "config_used.yaml"), "w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f)
 
