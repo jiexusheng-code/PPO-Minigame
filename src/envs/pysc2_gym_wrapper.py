@@ -22,6 +22,7 @@ class PySC2GymEnv(gym.Env):
         visualize: bool = False,
         debug_print: bool = True,
     ):
+        import logging, os, datetime
         super().__init__()
         self.map_name = map_name
         self.screen_size = screen_size
@@ -31,6 +32,21 @@ class PySC2GymEnv(gym.Env):
         self.debug_print = debug_print
         self._step_count = 0  # 记录步数
 
+        # 日志设置
+        log_dir = os.path.join("models", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        today_str = datetime.datetime.now().strftime("%Y%m%d")
+        log_path = os.path.join(log_dir, f"env_{today_str}.log")
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s %(levelname)s %(message)s',
+            handlers=[
+                logging.FileHandler(log_path, encoding='utf-8'),
+                logging.StreamHandler()
+            ]
+        )
+        self.logger = logging.getLogger("PySC2GymEnv")
+
         try:
             from pysc2.env import sc2_env
             from pysc2.lib import actions, features
@@ -38,6 +54,7 @@ class PySC2GymEnv(gym.Env):
             if not flags.FLAGS.is_parsed():
                 flags.FLAGS(["pysc2_env"])
         except Exception as exc:
+            self.logger.error(f"无法导入 pysc2，请确保已正确安装。错误详情: {exc}")
             raise RuntimeError(f"无法导入 pysc2，请确保已正确安装。错误详情: {exc}") from exc
 
         self.sc2_env = sc2_env
@@ -236,7 +253,7 @@ class PySC2GymEnv(gym.Env):
                     args.append([raw_int])
             return args, False
         except Exception as e:
-            print(f"[参数异常] {e}, fn_id={fn_id}, param_vec={param_vec}, 使用 no_op 回退")
+            self.logger.error(f"[参数异常] {e}, fn_id={fn_id}, param_vec={param_vec}, 使用 no_op 回退")
             return [], True
 
     def step(self, action) -> tuple:
@@ -263,7 +280,7 @@ class PySC2GymEnv(gym.Env):
             clipped = True
             exec_fn_id = self.actions.FUNCTIONS.no_op.id
             exec_args = []
-            print(f"[执行动作异常] {e}, fn_id={fn_id}, args={args}, 使用 no_op 回退")
+            self.logger.error(f"[执行动作异常] {e}, fn_id={fn_id}, args={args}, 使用 no_op 回退")
 
         timesteps = self._env.step([act])
         self.timestep = timesteps[0]  # 更新当前timestep
@@ -275,10 +292,10 @@ class PySC2GymEnv(gym.Env):
         truncated = False
         info = {"arg_clipped": clipped, "fn_available": fn_id in available}
         if self.debug_print:
-            print(f"Step {self._step_count}")
-            print(f"  Agent raw action: fn_id={fn_id}, raw_params={raw_params}")
-            print(f"  Executed action: fn_id={exec_fn_id}, args={exec_args}")
-            print(f"  Available actions: {len(available)}, reward={reward:.3f}, terminated={terminated}, clipped={clipped}")
+            self.logger.info(f"Step {self._step_count}")
+            self.logger.info(f"  Agent raw action: fn_id={fn_id}, raw_params={raw_params}")
+            self.logger.info(f"  Executed action: fn_id={exec_fn_id}, args={exec_args}")
+            self.logger.info(f"  Available actions: {len(available)}, reward={reward:.3f}, terminated={terminated}, clipped={clipped}")
         return obs, reward, terminated, truncated, info
 
     def render(self, mode="human"):
