@@ -59,25 +59,47 @@ class PySC2GymEnv(gym.Env):
 
     def _build_action_space(self):
         n_funcs = len(self.actions.FUNCTIONS)
-        max_args = 0
-        arg_sizes = []
+        # 1. 收集所有参数语义（唯一槽位）
+        param_semantics = []  # 语义唯一的参数名列表
+        param_semantics_set = set()
+        param_size_dict = {}  # 语义->最大size
         for fn in self.actions.FUNCTIONS:
-            max_args = max(max_args, len(fn.args))
-        for arg_idx in range(max_args):
-            max_size = 1
-            for fn in self.actions.FUNCTIONS:
-                if len(fn.args) <= arg_idx:
-                    continue
-                spec = fn.args[arg_idx]
+            for spec in fn.args:
                 name = getattr(spec, "name", "")
-                if "screen" in name or "minimap" in name:
+                # 只保留语义唯一的参数名
+                if name not in param_semantics_set:
+                    param_semantics.append(name)
+                    param_semantics_set.add(name)
+                # 统计最大size
+                if "screen" in name  or "screen2" in name:
                     size = self.screen_size * self.screen_size
+                elif "minimap" in name:
+                    size = self.minimap_size * self.minimap_size
                 else:
                     size = int(spec.sizes[0]) if getattr(spec, "sizes", None) else 1
-                max_size = max(max_size, size)
-            arg_sizes.append(max_size)
-        self._max_args = max_args
+                if name not in param_size_dict or size > param_size_dict[name]:
+                    param_size_dict[name] = size
+        # 2. 构建MultiDiscrete动作空间
+        arg_sizes = [param_size_dict[name] for name in param_semantics]
+        self._param_semantics = param_semantics  # 参数槽位顺序
+        self._param_size_dict = param_size_dict
+        self._fn_param_map = {}  # fn_id -> [槽位索引]
+        for fn in self.actions.FUNCTIONS:
+            slot_indices = []
+            for spec in fn.args:
+                name = getattr(spec, "name", "")
+                slot_indices.append(param_semantics.index(name))
+            self._fn_param_map[fn.id] = slot_indices
+        self._max_args = len(param_semantics)
         self.action_space = gym.spaces.MultiDiscrete([n_funcs] + arg_sizes)
+        # 打印参数槽位分配表，便于调试
+        if self.debug_print:
+            print("[动作参数槽位分配表]")
+            for i, name in enumerate(param_semantics):
+                print(f"槽位{i}: {name}, size={param_size_dict[name]}")
+            print("[动作类型到槽位映射]")
+            for fn in self.actions.FUNCTIONS:
+                print(f"fn_id={fn.id}, name={fn.name}, 槽位索引={self._fn_param_map[fn.id]}")
 
     def _lazy_init(self):
         if self._env is not None:
