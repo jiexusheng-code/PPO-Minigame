@@ -1,6 +1,6 @@
 env: MoveToBeacon
 out_dir: ./models
-n_envs: 1
+n_envs: 8                # 并行环境数，提升采样效率，推荐4~16
 seed: 0
 policy: MaskedFlattenPolicy
 policy_kwargs: {}
@@ -9,11 +9,14 @@ env_kwargs:
   minimap_size: 64
   step_mul: 8
   visualize: false
-total_timesteps: 100000
-learning_rate: 2.5e-4
-ent_coef: 0.01
-batch_size: 64
-n_epochs: 10
-gamma: 0.99
-gae_lambda: 0.95
-n_steps: 2048
+total_timesteps: 1000000     # 总训练步数，建议10万~100万
+learning_rate: 2.5e-4        # 学习率，PPO常用
+ent_coef: 0.01               # 策略熵系数，鼓励探索
+batch_size: 256              # 每次更新的batch，建议128~1024
+n_epochs: 10                 # 每轮更新的epoch数
+gamma: 0.99                  # 折扣因子
+gae_lambda: 0.95             # GAE参数
+n_steps: 2048                # 每个环境采样步数，建议512~4096
+clip_range: 0.2              # PPO裁剪范围
+vf_coef: 0.5                 # value loss系数
+max_grad_norm: 0.5           # 梯度裁剪

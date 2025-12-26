@@ -23,7 +23,10 @@ def load_config(path: str):
 def main():
     cfg = load_config(DEFAULT_CONFIG_PATH)
     env_name = cfg.get("env", "MoveToBeacon")
-    out_dir = cfg.get("out_dir", "./models")
+    import datetime
+    today_str = datetime.datetime.now().strftime("%Y%m%d%H")
+    base_dir = os.path.join("models", today_str)
+    out_dir = base_dir
     n_envs = cfg.get("n_envs", 1)
     seed = cfg.get("seed", 0)
     total_timesteps = cfg.get("total_timesteps", 100000)
@@ -37,9 +40,9 @@ def main():
     ppo_kwargs = {k: cfg[k] for k in ppo_param_keys if k in cfg}
     env_fn = make_env_fn(env_name, env_kwargs)
     vec_env = make_vec_env(env_fn, n_envs=n_envs, seed=seed, wrapper_class=Monitor)
-    import datetime
-    today_str = datetime.datetime.now().strftime("%Y%m%d")
-    tb_log = os.path.join(out_dir, "tb_logs")
+    tb_log = os.path.join(base_dir, "tb_logs")
+    log_dir = os.path.join(base_dir, "logs")
+    os.makedirs(log_dir, exist_ok=True)
     checkpoint_path = cfg.get("checkpoint_path", None)
     if checkpoint_path and os.path.isfile(checkpoint_path):
         print(f"[INFO] 从checkpoint加载模型: {checkpoint_path}")
