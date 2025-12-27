@@ -17,19 +17,17 @@ class PySC2GymEnv(gym.Env):
         self,
         map_name: str = None,
         screen_size: int = 64,
-        minimap_size: int = None,
+        minimap_size: int = 64,
         step_mul: int = 8,
         visualize: bool = False,
-        debug_print: bool = True,
     ):
         import logging, os, datetime
         super().__init__()
         self.map_name = map_name
         self.screen_size = screen_size
-        self.minimap_size = minimap_size if minimap_size is not None else screen_size
+        self.minimap_size = minimap_size 
         self.step_mul = step_mul
         self.visualize = visualize
-        self.debug_print = debug_print
         self._step_count = 0  # 记录步数
 
         # 日志设置：只用主进程的logging.basicConfig，所有模块共用同一日志文件
@@ -63,40 +61,44 @@ class PySC2GymEnv(gym.Env):
         self._build_observation_space_from_parser(parsed_flat)
 
     def _build_action_space(self):
-        n_funcs = len(self.actions.FUNCTIONS)
-        # 1. 收集所有参数语义（唯一槽位）
-        param_semantics = []  # 语义唯一的参数名列表
-        param_semantics_set = set()
-        param_size_dict = {}  # 语义->最大size
-        for fn in self.actions.FUNCTIONS:
-            for spec in fn.args:
-                name = getattr(spec, "name", "")
-                # 只保留语义唯一的参数名
-                if name not in param_semantics_set:
-                    param_semantics.append(name)
-                    param_semantics_set.add(name)
-                # 统计最大size，区分screen、screen2、minimap
-                if "minimap" in name:
-                    size = self.minimap_size * self.minimap_size
-                elif "screen2" in name or "screen" in name:
-                    size = self.screen_size * self.screen_size
-                else:
-                    size = int(spec.sizes[0]) if getattr(spec, "sizes", None) else 1
-                if name not in param_size_dict or size > param_size_dict[name]:
-                    param_size_dict[name] = size
-        # 2. 构建MultiDiscrete动作空间
-        arg_sizes = [param_size_dict[name] for name in param_semantics]
-        self._param_semantics = param_semantics  # 参数槽位顺序
-        self._param_size_dict = param_size_dict
-        self._fn_param_map = {}  # fn_id -> [槽位索引]
-        for fn in self.actions.FUNCTIONS:
-            slot_indices = []
-            for spec in fn.args:
-                name = getattr(spec, "name", "")
-                slot_indices.append(param_semantics.index(name))
-            self._fn_param_map[fn.id] = slot_indices
-        self._max_args = len(param_semantics)
-        self.action_space = gym.spaces.MultiDiscrete([n_funcs] + arg_sizes)
+        try:
+            n_funcs = len(self.actions.FUNCTIONS)
+            # 1. 收集所有参数语义（唯一槽位）
+            param_semantics = []  # 语义唯一的参数名列表
+            param_semantics_set = set()
+            param_size_dict = {}  # 语义->最大size
+            for fn in self.actions.FUNCTIONS:
+                for spec in fn.args:
+                    name = getattr(spec, "name")
+                    # 只保留语义唯一的参数名
+                    if name not in param_semantics_set:
+                        param_semantics.append(name)
+                        param_semantics_set.add(name)
+                    if getattr(spec, "sizes", None):
+                        if any(k in name for k in ["screen", "screen2"]):
+                            size = 84*84
+                        elif "minimap" in name: 
+                            size = 64*64
+                        else:
+                            size = int(spec.sizes[0])
+                    if name not in param_size_dict or size > param_size_dict[name]:
+                        param_size_dict[name] = size
+            # 2. 构建MultiDiscrete动作空间
+            arg_sizes = [param_size_dict[name] for name in param_semantics]
+            self._param_semantics = param_semantics  # 参数槽位顺序
+            self._param_size_dict = param_size_dict
+            self._fn_param_map = {}  # fn_id -> [槽位索引]
+            for fn in self.actions.FUNCTIONS:
+                slot_indices = []
+                for spec in fn.args:
+                    name = getattr(spec, "name")
+                    slot_indices.append(param_semantics.index(name))
+                self._fn_param_map[fn.id] = slot_indices
+            self._max_args = len(param_semantics)
+            self.action_space = gym.spaces.MultiDiscrete([n_funcs] + arg_sizes)
+        except Exception as e:
+            self.logger.error(f"构建动作空间失败: {e}")
+            raise RuntimeError(f"构建动作空间失败: {e}") from e
         
 
     def _lazy_init(self):
@@ -120,26 +122,33 @@ class PySC2GymEnv(gym.Env):
 
     def _build_observation_space_from_parser(self, parsed: Dict[str, object]):
         spaces: Dict[str, gym.Space] = {}
+        # spatial_fused
         spatial = parsed.get("spatial_fused")
         if spatial is not None:
             c, h, w = spatial.shape
             spaces["spatial_fused"] = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(c, h, w), dtype=np.float32)
-        scalar = parsed.get("scalar", {}) if isinstance(parsed.get("scalar", {}), dict) else {}
-        if "scalar_vec" in scalar:
-            vec = scalar["scalar_vec"]
-            spaces["scalar_vec"] = gym.spaces.Box(low=-np.inf, high=np.inf, shape=vec.shape, dtype=vec.dtype)
-        if "scalar_mask" in scalar:
-            mask = scalar["scalar_mask"]
-            spaces["scalar_mask"] = gym.spaces.Box(low=0.0, high=1.0, shape=mask.shape, dtype=mask.dtype)
-        entities = parsed.get("entities", {}) if isinstance(parsed.get("entities", {}), dict) else {}
-        if entities:
-            N = getattr(self._parser, "N_max", 512)
+        # scalar_vec（obs_parser输出直接是np.ndarray，flatten后key为scalar_vec）
+        scalar_vec = parsed.get("scalar_vec")
+        if scalar_vec is not None:
+            spaces["scalar_vec"] = gym.spaces.Box(low=-np.inf, high=np.inf, shape=scalar_vec.shape, dtype=scalar_vec.dtype)
+        # entities
+        N = getattr(self._parser, "N_max", 512)
+        type_ids = parsed.get("type_ids")
+        if type_ids is not None:
             spaces["type_ids"] = gym.spaces.Box(low=0, high=1e6, shape=(N,), dtype=np.int64)
+        owner_ids = parsed.get("owner_ids")
+        if owner_ids is not None:
             spaces["owner_ids"] = gym.spaces.Box(low=0, high=10, shape=(N,), dtype=np.int64)
-            ent_feats_shape = entities.get("ent_feats", np.zeros((N, 5))).shape
-            spaces["ent_feats"] = gym.spaces.Box(low=-np.inf, high=np.inf, shape=ent_feats_shape, dtype=np.float32)
+        ent_feats = parsed.get("ent_feats")
+        if ent_feats is not None:
+            spaces["ent_feats"] = gym.spaces.Box(low=-np.inf, high=np.inf, shape=ent_feats.shape, dtype=np.float32)
+        ent_mask = parsed.get("ent_mask")
+        if ent_mask is not None:
             spaces["ent_mask"] = gym.spaces.Box(low=0.0, high=1.0, shape=(N,), dtype=np.float32)
+        coords = parsed.get("coords")
+        if coords is not None:
             spaces["coords"] = gym.spaces.Box(low=0, high=self.screen_size, shape=(N, 2), dtype=np.int32)
+        # action_mask
         action_mask = parsed.get("action_mask")
         if action_mask is not None:
             spaces["action_mask"] = gym.spaces.Box(low=0.0, high=1.0, shape=action_mask.shape, dtype=np.float32)
@@ -163,13 +172,13 @@ class PySC2GymEnv(gym.Env):
                 out[name] = np.array(val, dtype=dtype, copy=False)
             except Exception:
                 return
+        # flatten spatial_fused
         if "spatial_fused" in parsed:
             _add("spatial_fused", parsed["spatial_fused"], np.float32)
-        scalar = parsed.get("scalar", {}) if isinstance(parsed.get("scalar", {}), dict) else {}
-        if "scalar_vec" in scalar:
-            _add("scalar_vec", scalar["scalar_vec"], np.float32)
-        if "scalar_mask" in scalar:
-            _add("scalar_mask", scalar["scalar_mask"], np.float32)
+        # flatten scalar（obs_parser输出直接是np.ndarray，不是dict）
+        if "scalar" in parsed and parsed["scalar"] is not None:
+            _add("scalar_vec", parsed["scalar"], np.float32)
+        # flatten entities
         entities = parsed.get("entities", {}) if isinstance(parsed.get("entities", {}), dict) else {}
         if entities:
             _add("type_ids", entities.get("type_ids"), np.int64)
@@ -177,6 +186,7 @@ class PySC2GymEnv(gym.Env):
             _add("ent_feats", entities.get("ent_feats"), np.float32)
             _add("ent_mask", entities.get("ent_mask"), np.float32)
             _add("coords", entities.get("coords"), np.int32)
+        # flatten action_mask
         if "action_mask" in parsed:
             _add("action_mask", parsed["action_mask"], np.float32)
         return out
@@ -253,6 +263,7 @@ class PySC2GymEnv(gym.Env):
         parsed_flat_now = self._flatten_parsed(parsed_now)
         action_mask = parsed_flat_now.get("action_mask")
         if action_mask is None:
+            logger.error("action_mask missing; cannot determine available actions")
             raise RuntimeError("action_mask missing; cannot determine available actions")
         available = np.nonzero(np.asarray(action_mask).reshape(-1))[0].tolist()
 
@@ -278,11 +289,11 @@ class PySC2GymEnv(gym.Env):
         terminated = bool(self.timestep.last())
         truncated = False
         info = {"arg_clipped": clipped, "fn_available": fn_id in available}
-        if self.debug_print:
-            self.logger.info(f"Step {self._step_count}")
-            self.logger.info(f"  Agent raw action: fn_id={fn_id}, raw_params={raw_params}")
-            self.logger.info(f"  Executed action: fn_id={exec_fn_id}, args={exec_args}")
-            self.logger.info(f"  Available actions: {len(available)}, reward={reward:.3f}, terminated={terminated}, clipped={clipped}")
+        
+        self.logger.info(f"Step {self._step_count}")
+        self.logger.info(f"  Agent raw action: fn_id={fn_id}, raw_params={raw_params}")
+        self.logger.info(f"  Executed action: fn_id={exec_fn_id}, args={exec_args}")
+        self.logger.info(f"  Available actions: {len(available)}, reward={reward:.3f}, terminated={terminated}, clipped={clipped}")
         return obs, reward, terminated, truncated, info
 
     def render(self, mode="human"):

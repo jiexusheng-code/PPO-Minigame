@@ -1,9 +1,9 @@
 [动作参数槽位分配表]
 槽位0: minimap, size=4096
 槽位1: select_point_act, size=4
-槽位2: screen, size=4096
+槽位2: screen, size=7056
 槽位3: select_add, size=2
-槽位4: screen2, size=4096
+槽位4: screen2, size=7056
 槽位5: control_group_act, size=5
 槽位6: control_group_id, size=10
 槽位7: select_unit_act, size=4
