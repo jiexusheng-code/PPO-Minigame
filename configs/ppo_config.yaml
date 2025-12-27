@@ -1,6 +1,7 @@
 env: MoveToBeacon
 out_dir: ./models
-n_envs: 8                # 并行环境数，提升采样效率，推荐4~16
+checkpoint_path: null    # 若有预训练模型，可填入路径继续训练
+n_envs: 4                # 并行环境数，提升采样效率，推荐4~16
 seed: 0
 policy: MaskedFlattenPolicy
 policy_kwargs: {}

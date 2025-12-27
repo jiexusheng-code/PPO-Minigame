@@ -232,16 +232,16 @@ class PySC2GymEnv(gym.Env):
                     raise RuntimeError(f"参数类型错误: fn_id={fn_id}, 参数{name}, 槽位={slot}, raw_val={raw_val}")
 
                 if "minimap" in name:
-                    max_flat = self.minimap_size * self.minimap_size
+                    max_flat = 64 * 64
                     if not (0 <= raw_int < max_flat):
                         raise ValueError(f"参数越界: fn_id={fn_id}, 参数{name}, 槽位={slot}, raw_val={raw_val}")
-                    y, x = divmod(raw_int, self.minimap_size)
+                    y, x = divmod(raw_int, 64)
                     args.append([x, y])
                 elif "screen" in name or "screen2" in name:
-                    max_flat = self.screen_size * self.screen_size
+                    max_flat = 84 * 84
                     if not (0 <= raw_int < max_flat):
                         raise ValueError(f"参数越界: fn_id={fn_id}, 参数{name}, 槽位={slot}, raw_val={raw_val}")
-                    y, x = divmod(raw_int, self.screen_size)
+                    y, x = divmod(raw_int, 84)
                     args.append([x, y])
                 else:
                     size = int(sizes[0]) if len(sizes) > 0 else 1
