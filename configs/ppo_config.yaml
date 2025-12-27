@@ -9,7 +9,7 @@ env_kwargs:
   minimap_size: 64
   step_mul: 8
   visualize: false
-total_timesteps: 1000000     # 总训练步数，建议10万~100万
+total_timesteps: 100000     # 总训练步数，建议10万~100万
 learning_rate: 2.5e-4        # 学习率，PPO常用
 ent_coef: 0.01               # 策略熵系数，鼓励探索
 batch_size: 256              # 每次更新的batch，建议128~1024

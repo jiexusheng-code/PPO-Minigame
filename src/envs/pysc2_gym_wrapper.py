@@ -108,7 +108,6 @@ class PySC2GymEnv(gym.Env):
             action_space=self.actions.ActionSpace.FEATURES,
             use_raw_actions=False,
         )
-        # 与obs_parser.py测试代码保持一致，显式设置game_steps_per_episode=0
         self._env = self.sc2_env.SC2Env(
             map_name=self.map_name,
             players=[self.sc2_env.Agent(self.sc2_env.Race.terran)],
