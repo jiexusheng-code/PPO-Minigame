@@ -4,7 +4,7 @@ import os
 import yaml
 import logging
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.callbacks import EvalCallback
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.monitor import Monitor
 from src.policies.masked_flatten_policy import MaskedFlattenPolicy
@@ -79,10 +79,20 @@ def main():
         model = PPO.load(checkpoint_path, env=vec_env, tensorboard_log=tb_log, policy=policy, policy_kwargs=policy_kwargs, **ppo_kwargs)
     else:
         model = PPO(policy, vec_env, verbose=1, tensorboard_log=tb_log, policy_kwargs=policy_kwargs, **ppo_kwargs)
-    checkpoint_prefix = f"ppo_sc2_{today_str}"
-    checkpoint_cb = CheckpointCallback(save_freq=10000, save_path=out_dir, name_prefix=checkpoint_prefix)
+    # 使用EvalCallback只保存表现最好的模型
+    eval_env = make_vec_env(env_fn, n_envs=1, seed=seed+100, wrapper_class=Monitor)
+    eval_callback = EvalCallback(
+        eval_env,
+        best_model_save_path=out_dir,
+        log_path=out_dir,
+        eval_freq=10000,
+        deterministic=True,
+        render=False,
+        n_eval_episodes=5,
+        save_best_only=True
+    )
     logger.info(f"开始训练，总步数: {total_timesteps}")
-    model.learn(total_timesteps=total_timesteps, callback=checkpoint_cb)
+    model.learn(total_timesteps=total_timesteps, callback=eval_callback)
     logger.info("训练完成，保存最终模型...")
     model.save(os.path.join(out_dir, f"final_model_{today_str}"))
     with open(os.path.join(out_dir, "config_used.yaml"), "w", encoding="utf-8") as f:
