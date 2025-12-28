@@ -10,7 +10,7 @@ tensorboard>=2.0.0
 matplotlib>=3.0.0
 numpy<2.0
 pyyaml>=6.0
-logging
+#logging
 # 推荐用conda安装pytorch/torchvision/torchaudio（避免pip wheel冲突）
 # 官方推荐命令（根据你的CUDA版本选择）：
 # conda install pytorch torchvision torchaudio cpuonly -c pytorch  # 仅CPU

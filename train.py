@@ -90,4 +90,22 @@ def main():
     logger.info("配置已保存: config_used.yaml")
 
 if __name__ == "__main__":
+    # 修复 pysc2 的 shuffled_hue 问题，兼容 Python 3.9+
+    import sys
+    import types
+
+    def shuffled_hue_patch(palette_size):
+        import random
+        palette = [i for i in range(palette_size)]
+        random.shuffle(palette)  # Python 3.9+ 兼容写法
+        return palette
+
+    # 猴子补丁 pysc2 的 shuffled_hue
+    sys.modules_backup = dict(sys.modules)
+    try:
+        import pysc2.lib.colors
+        pysc2.lib.colors.shuffled_hue = shuffled_hue_patch
+    except ImportError:
+        pass
+
     main()
