@@ -88,8 +88,7 @@ def main():
         eval_freq=10000,
         deterministic=True,
         render=False,
-        n_eval_episodes=5,
-        save_best_only=True
+        n_eval_episodes=5
     )
     logger.info(f"开始训练，总步数: {total_timesteps}")
     model.learn(total_timesteps=total_timesteps, callback=eval_callback)
