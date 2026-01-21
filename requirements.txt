@@ -1,19 +1,16 @@
-# RL minigame PPO项目依赖
+# RL minigame PPO 项目依赖（pip 安装列表）
+# 说明：此文件列出代码中直接使用的 pip 包。PyTorch 建议通过 conda 安装以避免二进制冲突，见下方注释。
 stable-baselines3==2.3.0
-sb3-contrib==2.3.0
 gymnasium==0.29.1
 pysc2==3.0.0
 protobuf>=3.20,<4.0
 absl-py>=1.0.0
 opencv-python>=4.8.0
 tensorboard>=2.0.0
-matplotlib>=3.0.0
 numpy<2.0
 pyyaml>=6.0
-#logging
-# 推荐用conda安装pytorch/torchvision/torchaudio（避免pip wheel冲突）
-# 官方推荐命令（根据你的CUDA版本选择）：
-# conda install pytorch torchvision torchaudio cpuonly -c pytorch  # 仅CPU
-# conda install pytorch torchvision torchaudio pytorch-cuda=11.8 -c pytorch -c nvidia  # CUDA 11.8
-# 其它CUDA版本请参考 https://pytorch.org/get-started/locally/
+
+# 可选：推荐使用 conda 安装 PyTorch（避免 pip wheel 冲突），例如：
+# conda install pytorch=2.2 cpuonly -c pytorch -c conda-forge
+# 或根据你的 CUDA 版本选择合适的 pytorch/pytorch-cuda 组合，详见 https://pytorch.org/get-started/locally/
 

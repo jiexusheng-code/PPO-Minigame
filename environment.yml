@@ -1,4 +1,4 @@
-name: minigame
+name: PPO-minigame
 channels:
   - conda-forge
   - pytorch
@@ -6,19 +6,15 @@ channels:
 dependencies:
   - python=3.10
   - pip
-  - numpy<2.0
+  - "numpy<2.0"
   - cpuonly
   - pytorch=2.2
-  - torchvision=0.17
-  - torchaudio=2.2
-  - gymnasium=0.29
-  - matplotlib
-  - tensorboard
-  - opencv
-  - absl-py
-  - protobuf>=3.20,<4.0
-  - pyyaml
   - pip:
     - stable-baselines3==2.3.0
-    - sb3-contrib==2.3.0
     - pysc2==3.0.0
+    - gymnasium==0.29.1
+    - tensorboard
+    - opencv-python>=4.8.0
+    - absl-py>=1.0.0
+    - "protobuf>=3.20,<4.0"
+    - pyyaml>=6.0
