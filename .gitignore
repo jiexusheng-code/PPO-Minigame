@@ -59,3 +59,4 @@ credentials/
 # Large files (use Git LFS if needed)
 # *.bin
 # *.zip
+pysc2/
