@@ -7,10 +7,13 @@ protobuf>=3.20,<4.0
 absl-py>=1.0.0
 opencv-python>=4.8.0
 tensorboard>=2.0.0
-numpy<2.0
 pyyaml>=6.0
 
 # 可选：推荐使用 conda 安装 PyTorch（避免 pip wheel 冲突），例如：
 # conda install pytorch=2.2 cpuonly -c pytorch -c conda-forge
 # 或根据你的 CUDA 版本选择合适的 pytorch/pytorch-cuda 组合，详见 https://pytorch.org/get-started/locally/
+
+# NOTE: Install `numpy` and `scipy` and `scikit-video` via conda-forge to avoid
+# binary conflicts (do not install numpy/scipy with pip inside the conda env):
+# conda install -y -c conda-forge "numpy<2.0" scipy scikit-video
 

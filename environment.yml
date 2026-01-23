@@ -7,6 +7,8 @@ dependencies:
   - python=3.10
   - pip
   - "numpy<2.0"
+  - scipy
+  - scikit-video
   - cpuonly
   - pytorch=2.2
   - pip:
