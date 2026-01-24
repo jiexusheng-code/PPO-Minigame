@@ -10,6 +10,10 @@
 
 本文档旨在系统性说明 PySC2 的动作空间（非 RAW / RAW）。
 
+[TOC]
+
+
+
 # 1. 非 RAW 动作
 
 非 RAW 动作基于“屏幕 / 小地图坐标与 UI 交互逻辑”，动作以 `actions.FunctionCall` 表示：

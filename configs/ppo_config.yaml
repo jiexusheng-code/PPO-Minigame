@@ -1,7 +1,7 @@
-n_env: MoveToBeacon
+env: MoveToBeacon
 out_dir: ./models
 checkpoint_path: ./models/2025122811/ppo_sc2_2025122811_80000_steps.zip    # 继续训练用最新checkpoint
-n_envs: 4                # 并行环境数，提升采样效率，推荐4~16
+n_envs: 4                    # 并行环境的数量，也就是同时跑多少个环境实例来采样数据。值越大，采样效率通常更高，但会占用更多 CPU/GPU 和内存资源。
 seed: 0
 policy: MaskedFlattenPolicy
 policy_kwargs: {}
