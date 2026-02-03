@@ -44,6 +44,9 @@ checkpoints/
 logs/
 reports/
 
+# Tests
+src/tests/
+
 # OS files
 .DS_Store
 Thumbs.db
@@ -60,3 +63,4 @@ credentials/
 # *.bin
 # *.zip
 pysc2/
+s2client-proto/
