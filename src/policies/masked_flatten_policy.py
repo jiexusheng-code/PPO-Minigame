@@ -22,6 +22,14 @@ class MaskedFlattenPolicy(MultiInputPolicy):
     def forward(self, obs, deterministic: bool = False):
         # 1. 特征提取
         features = self.extract_features(obs)
+        # 懒初始化 LayerNorm：按特征维度归一化，减轻不同输入尺度的影响
+        if not hasattr(self, "_feat_layernorm"):
+            self._feat_layernorm = nn.LayerNorm(features.shape[1])
+            try:
+                self._feat_layernorm.to(features.device)
+            except Exception:
+                pass
+        features = self._feat_layernorm(features)
         latent_pi, latent_vf = self.mlp_extractor(features)
         values = self.value_net(latent_vf)
         logits = self.action_net(latent_pi)

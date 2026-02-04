@@ -1,372 +1,608 @@
 """
-这份环境解析器是针对PYSC2中的minigame环境的，故在选取环境信息时做了简化处理。
+Observation Parser: 将 PYSC2 的原始 observation 转化为固定结构的状态表示
+
+设计原则：
+1. 输出结构固定，支持跨地图使用
+2. 地图差异通过配置驱动，不改变输出形状
+3. 使用 mask 标记可用信息，避免缺省值混淆
+4. minigame 专用（不处理复杂模式的观测）
+
+输出格式：
+{
+    "vector": np.array([...]),              # 结构化向量特征（固定长度）
+    "screen": np.array([...]),              # 屏幕空间特征 (H, W, C)
+    "minimap": np.array([...]),             # 小地图空间特征 (H, W, C)
+    "available_actions": np.array([...]),   # one-hot 可用动作
+    "screen_layer_flags": np.array([...]),  # 每个 screen 层的 0/1 标志
+    "minimap_layer_flags": np.array([...]), # 每个 minimap 层的 0/1 标志
+    "vector_mask": np.array([...]),         # 每个 vector 维度的 0/1 标志
+}
 """
 
 import numpy as np
-import cv2
-import time
-import logging
-from typing import Dict, Optional, Any
-
-from pysc2.lib import actions as sc2_actions
-from pysc2.lib import units as sc2_units
-from pysc2 import maps as sc2_maps
-
-# 日志配置：与主程序保持一致，归档到统一目录
-logger = logging.getLogger("rl.obs_parser")
-
-def _default_unit_type_vocab() -> Dict[int, int]:
-    vocab: Dict[int, int] = {}
-    idx = 1
-    for race_name in ("Neutral", "Protoss", "Terran", "Zerg"):
-        enum_cls = getattr(sc2_units, race_name, None)
-        if enum_cls is None:
-            continue
-        for entry in enum_cls:
-            vocab[int(entry.value)] = idx
-            idx += 1
-    return vocab
+from typing import Dict, Any, List
+from pysc2.lib import features, actions
 
 
-def _default_map_name_vocab() -> Dict[str, int]:
-    available = sc2_maps.get_maps()
-    return {name: idx for idx, name in enumerate(sorted(available.keys()), start=1)}
+# ======================== 配置部分 ========================
+
+class MapConfig:
+    """地图配置基类"""
+    
+    def __init__(self, map_name: str):
+        self.map_name = map_name
+        # 结构化向量的字段定义（字段名 -> 数据类型 + 处理函数）
+        # 默认对所有 minigame 使用相同的 player 8 维字段
+        self.vector_fields = {
+            "player_vec": {
+                "indices": [1, 2, 3, 4, 5, 6, 7, 8],
+                "size": 8,
+                "dtype": np.float32,
+                "normalize": True,
+                # 默认全部有效；各地图可仅覆盖 valid
+                "valid": [True, True, True, True, True, True, True, True],
+            }
+        }
+        # 所有 minigame 统一输出 7 层（canonical 顺序）
+        self.screen_layers = [
+            (features.ScreenFeatures.visibility_map, "visibility_map"),
+            (features.ScreenFeatures.player_relative, "player_relative"),
+            (features.ScreenFeatures.unit_type, "unit_type"),
+            (features.ScreenFeatures.selected, "selected"),
+            (features.ScreenFeatures.unit_hit_points_ratio, "unit_hit_points_ratio"),
+            (features.ScreenFeatures.build_progress, "build_progress"),
+            (features.ScreenFeatures.buildable, "buildable"),
+        ]
+        # 屏幕特征层实际需要的子集（按 name 标记，None 表示全用）
+        self.screen_active_layers = None
+        # 小地图特征层选择（canonical 顺序）
+        self.minimap_layers = [
+            (features.MinimapFeatures.visibility_map, "visibility_map"),
+            (features.MinimapFeatures.player_relative, "player_relative"),
+            (features.MinimapFeatures.selected, "selected"),
+            (features.MinimapFeatures.unit_type, "unit_type"),
+            (features.MinimapFeatures.alerts, "alerts"),
+            (features.MinimapFeatures.buildable, "buildable"),
+        ]
+        # 小地图特征层实际需要的子集（按 name 标记，None 表示全用）
+        self.minimap_active_layers = None
+        # 屏幕/小地图的归一化尺寸
+        self.screen_size = 32
+        self.minimap_size = 32
 
 
-def _default_action_vocab_size() -> int:
-    """为了方便使用动作掩码，这里使用 PySC2 的 FUNCTIONS（非 RAW_FUNCTIONS）动作表。"""
-    return len(getattr(sc2_actions, "FUNCTIONS", []))
 
+class MoveToBeaconConfig(MapConfig):
+    """MoveToBeacon 配置（仅需简单观测）"""
+    
+    def __init__(self):
+        super().__init__("MoveToBeacon")
+        
+        # MoveToBeacon 不需要 player 8 维信息，仅覆盖 valid 置为 False
+        # NOTE: 仅支持与 indices 等长的布尔列表/数组（每个维度单独有效/无效）
+        self.vector_fields["player_vec"]["valid"] = [
+            False, False, False, False, False, False, False, False
+        ]
+        # 对于 MoveToBeacon，只需要 player_relative、selected 两层
+        self.screen_active_layers = {"player_relative", "selected"}
+        self.minimap_active_layers = {"player_relative", "selected"}
+
+
+# 地图配置映射表
+AVAILABLE_MAPS = {
+    "MoveToBeacon": MoveToBeaconConfig,
+}
+
+
+# ======================== ObsParser 类 ========================
 
 class ObsParser:
-    def __init__(
-        self,
-        unit_type_vocab: Optional[dict] = None,
-        map_name_vocab: Optional[dict] = None,
-        action_vocab_size: Optional[int] = None,
-        H: int = 64,
-        W: int = 64,
-        N_max: int = 64,#针对minigame环境，实体数量不多，64足矣
-    ):
-        #几个表都使用默认排序，减少工作量
-        self.unit_type_vocab = (
-            unit_type_vocab if unit_type_vocab is not None else _default_unit_type_vocab()
-        )
-        self.map_name_vocab = (
-            map_name_vocab if map_name_vocab is not None else _default_map_name_vocab()
-        )
-        self.action_vocab_size = (
-            action_vocab_size if action_vocab_size is not None else _default_action_vocab_size()
-        )
-        self.H = H
-        self.W = W
-        self.N_max = N_max
-
-        logger.info("ObsParser initialized successfully.")
-
-    def parse_entities(self, obs: Any) -> dict:
+    """
+    PYSC2 observation 解析器
+    
+    将原始 observation 转化为固定结构、可跨地图使用的状态表示
+    """
+    
+    def __init__(self, map_name: str):
         """
-        Process raw entity list into structured tensors:
-          - type_ids: [N_max]
-          - owner_ids: [N_max]
-          - ent_feats: [N_max, D_num]
-          - ent_mask: [N_max]
-          - coords: [N_max, 2]
+        Args:
+            map_name: 地图名称（如 "MoveToBeacon"）
         """
-        try:
-            units = obs.feature_units
-        except Exception as e:
-            logger.error(f"无法提取feature_units: {e}")
-            raise RuntimeError(f"无法提取feature_units: {e}")
-        N = min(len(units), self.N_max)
-
-        type_ids = np.zeros(self.N_max, dtype=np.int64)
-        owner_ids = np.zeros(self.N_max, dtype=np.int64)
-        health_ratio = np.zeros(self.N_max, dtype=np.float32)
-        build_progress = np.zeros(self.N_max, dtype=np.float32)
-        facing = np.zeros(self.N_max, dtype=np.float32)
-        radius = np.zeros(self.N_max, dtype=np.float32)
-        mineral_contents = np.zeros(self.N_max, dtype=np.float32)
-        vespene_contents = np.zeros(self.N_max, dtype=np.float32)
-        assigned_harvesters = np.zeros(self.N_max, dtype=np.float32)
-        ideal_harvesters = np.zeros(self.N_max, dtype=np.float32)
-        weapon_cooldown = np.zeros(self.N_max, dtype=np.float32)
-        sel_flag = np.zeros(self.N_max, dtype=np.float32)
-        xs = np.zeros(self.N_max, dtype=np.float32)
-        ys = np.zeros(self.N_max, dtype=np.float32)
-        ent_mask = np.zeros(self.N_max, dtype=np.float32)
-        owner_ids = np.zeros(self.N_max, dtype=np.int64)
-
-        for i, u in enumerate(units[:N]):
-            try:
-                type_ids[i] = self.unit_type_vocab.get(getattr(u, "unit_type"), 0)
-                owner_ids[i] = getattr(u, "alliance")
-                health_ratio[i] = getattr(u, "health_ratio")
-                build_progress[i] = getattr(u, "build_progress")
-                facing[i] = getattr(u, "facing")
-                radius[i] = getattr(u, "radius")
-                mineral_contents[i] = getattr(u, "mineral_contents")
-                vespene_contents[i] = getattr(u, "vespene_contents")
-                assigned_harvesters[i] = getattr(u, "assigned_harvesters")
-                ideal_harvesters[i] = getattr(u, "ideal_harvesters")
-                weapon_cooldown[i] = getattr(u, "weapon_cooldown")
-                sel_flag[i] = float(getattr(u, "is_selected"))
-                xs[i] = getattr(u, "x")
-                ys[i] = getattr(u, "y")
-                ent_mask[i] = 1.0
-            except Exception as e:
-                logger.error(f"parse_entities特征提取失败: {e}")
-                raise
-
-        gx = np.clip(
-            (xs / (xs.max(initial=1) + 1e-6)) * (self.W - 1), 0, self.W - 1
-        ).astype(np.int32)
-        gy = np.clip(
-            (ys / (ys.max(initial=1) + 1e-6)) * (self.H - 1), 0, self.H - 1
-        ).astype(np.int32)
-
-        ent_feats = np.stack([
-            health_ratio, build_progress, facing, radius,
-            mineral_contents, vespene_contents,
-            assigned_harvesters, ideal_harvesters, weapon_cooldown, sel_flag
-        ], axis=1)
+        if map_name not in AVAILABLE_MAPS:
+            raise ValueError(
+                f"Map '{map_name}' not configured. Available: {list(AVAILABLE_MAPS.keys())}"
+            )
+        
+        self.map_name = map_name
+        self.config = AVAILABLE_MAPS[map_name]()
+        
+        # 从配置中获取尺寸参数
+        self.screen_size = self.config.screen_size
+        self.minimap_size = self.config.minimap_size
+        
+        # 向量使用规范长度（canonical），便于跨地图复用与有效性掩码
+        # 默认采用 SC2 player 向量中的 11 个字段作为规范长度
+        # 优先使用配置中声明的 canonical_vector_size
+        self.vector_size = getattr(self.config, "canonical_vector_size", None)
+        if self.vector_size is None:
+            self.vector_size = sum(field["size"] for field in self.config.vector_fields.values())
+        
+        # 可用动作的维度（所有可能的 PYSC2 函数）
+        self.num_actions = len(actions.FUNCTIONS)
+        
+        # 屏幕和小地图的通道数
+        self.screen_channels = len(self.config.screen_layers)
+        self.minimap_channels = len(self.config.minimap_layers)
+    
+    def get_output_spec(self) -> Dict[str, Any]:
+        """
+        获取输出状态的规格（用于初始化网络输入层）
+        
+        Returns:
+            包含各部分 shape 和 dtype 的字典
+        """
         return {
-            "type_ids": type_ids,
-            "owner_ids": owner_ids,
-            "ent_feats": ent_feats,
-            "ent_mask": ent_mask,
-            "coords": np.stack([gx, gy], axis=1),
+            "vector": {
+                "shape": (self.vector_size,),
+                "dtype": np.float32,
+                "desc": "结构化向量特征（player信息等）"
+            },
+            "screen": {
+                "shape": (self.screen_size, self.screen_size, self.screen_channels),
+                "dtype": np.float32,
+                "desc": f"屏幕特征层：{[name for _, name in self.config.screen_layers]}"
+            },
+            "minimap": {
+                "shape": (self.minimap_size, self.minimap_size, self.minimap_channels),
+                "dtype": np.float32,
+                "desc": f"小地图特征层：{[name for _, name in self.config.minimap_layers]}"
+            },
+            "available_actions": {
+                "shape": (self.num_actions,),
+                "dtype": np.float32,
+                "desc": "可用动作 one-hot 向量"
+            },
+            "screen_layer_flags": {
+                "shape": (self.screen_channels,),
+                "dtype": np.float32,
+                "desc": "每个 canonical screen 层的 0/1 标志（顺序与 config.screen_layers 一致）"
+            },
+            "minimap_layer_flags": {
+                "shape": (self.minimap_channels,),
+                "dtype": np.float32,
+                "desc": "每个 canonical minimap 层的 0/1 标志（顺序与 config.minimap_layers 一致）"
+            },
+            "vector_mask": {
+                "shape": (self.vector_size,),
+                "dtype": np.float32,
+                "desc": "结构化向量每一维的 0/1 有效性标志（与 vector 对齐）"
+            },
         }
+    
+    def parse(self, obs: Dict) -> Dict[str, np.ndarray]:
+        """Parse a single observation and return inputs with explicit masks."""
+        # 提取向量特征（不在 parser 内门控，mask 单独输出）
+        vector, vector_mask = self._extract_vector(obs)
 
-    def _ensure_scalar_projection(self, input_dim: int, target_dim: int):
-        need_new = (
-            not hasattr(self, "scalar_projection")
-            or getattr(self, "_scalar_proj_in_dim", None) != input_dim
-            or getattr(self, "_scalar_proj_dim", None) != target_dim
-        )
-        if need_new:
-            projection_np = np.random.randn(input_dim, target_dim).astype(np.float32)
-            q_np, _ = np.linalg.qr(projection_np)
-            self.scalar_projection = (q_np * np.sqrt(1.0 / input_dim)).astype(np.float16)
-            self._scalar_projection_backend = "cpu"
-            self._scalar_proj_in_dim = input_dim
-            self._scalar_proj_dim = target_dim
-        return self.scalar_projection
+        # 提取空间特征（不在 parser 内门控，mask 单独输出）
+        screen = self._extract_screen(obs)
+        minimap = self._extract_minimap(obs)
 
+        # 提取可用动作
+        available_actions = self._extract_available_actions(obs)
 
-    def parse_scalar(self, obs: Any) -> np.ndarray:
+        # 每层激活标志（独立输出，由模型侧做门控）
+        active_set = self.config.screen_active_layers
+        if active_set is None:
+            screen_layer_flags = np.ones(self.screen_channels, dtype=np.float32)
+        else:
+            screen_layer_flags = np.array([
+                1.0 if name in active_set else 0.0
+                for _, name in self.config.screen_layers
+            ], dtype=np.float32)
+
+        minimap_active_set = self.config.minimap_active_layers
+        if minimap_active_set is None:
+            minimap_layer_flags = np.ones(self.minimap_channels, dtype=np.float32)
+        else:
+            minimap_layer_flags = np.array([
+                1.0 if name in minimap_active_set else 0.0
+                for _, name in self.config.minimap_layers
+            ], dtype=np.float32)
+
+        return {
+            "vector": vector,
+            "screen": screen,
+            "minimap": minimap,
+            "available_actions": available_actions,
+            "screen_layer_flags": screen_layer_flags,
+            "minimap_layer_flags": minimap_layer_flags,
+            "vector_mask": vector_mask,
+        }
+    
+    def _extract_vector(self, obs: Dict) -> tuple:
         """
-        提取minigame中有意义的全局标量，输出定长向量。
-        选取特征：
-        - map_id（地图编号）
-        - game_loop（归一化步数）
-        - player资源与人口（minerals, vespene, food_used, food_cap, army_count, idle_worker_count）
-        - score_cumulative（总分、采集、消灭等）
-        - last_action（最近一次动作id，归一化）
-        - available_actions数量
-        - control_groups数量
-        - alerts数量
+        提取结构化向量特征
+        
+        【MoveToBeacon】：
+        - player 信息（11维）：玩家ID、矿物、瓦斯、人口、军队数等
+          用途：让agent知道当前资源状态（虽然MoveToBeacon中这些信息基本不变，
+                但保留是为了代码的通用性）
+          处理：逐维归一化到 [0, 1]
         """
-        try:
-            # 地图编号
-            map_id = float(self.map_name_vocab.get(obs.map_name))
+        # 输出为选取字段的拼接向量（长度 = sum sizes），并返回对应的有效性掩码
+        vec_list = []
+        mask_list = []
 
-            # 游戏步数归一化
-            game_loop = float(np.asarray(obs.game_loop).flatten()[0])
-            game_loop_norm = game_loop / 1e4
+        if "player_vec" in self.config.vector_fields:
+            field_cfg = self.config.vector_fields["player_vec"]
+            indices = field_cfg["indices"]
+            player_vals = obs["player"][indices].astype(np.float32)
 
-            # 玩家资源与人口
-            player = np.asarray(obs.player).flatten()
-            player_feats =  [float(player[i]) for i in range(1, 9)]
+            if field_cfg.get("normalize", False):
+                player_vals = np.log1p(player_vals)
 
-            score = np.asarray(obs.score_cumulative).flatten()
-            score_feats = [
-                float(score[0]) ,   # score
-                float(score[5]) ,   # killed_value_units
-                float(score[6]) ,   # killed_value_structures
-                float(score[7]) ,   # collected_minerals
-                float(score[8]) ,   # collected_vespene
-                float(score[11]) , # spent_minerals
-                float(score[12]) , # spent_vespene
-            ]
+            # 门控：仅支持与 indices 等长的布尔列表/数组（每维单独有效/无效）
+            if "valid" not in field_cfg:
+                raise RuntimeError("vector field 'player_vec' must provide 'valid' as a boolean list/array matching indices length")
 
-            # last_action（最近一次动作id，归一化）
-            last_actions = np.asarray(getattr(obs, "last_actions", []))
-            if last_actions.size > 0:
-                last_action = float(last_actions[-1]) / max(1.0, float(self.action_vocab_size - 1))
+            valid_cfg = field_cfg["valid"]
+            valid_mask = np.asarray(valid_cfg, dtype=np.bool_)
+            if valid_mask.shape[0] != len(indices):
+                raise RuntimeError(f"'valid' length {valid_mask.shape[0]} doesn't match indices length {len(indices)} for player_vec")
+
+            vec_list.append(player_vals)
+            mask_list.append(valid_mask.astype(np.float32))
+
+        if len(vec_list) == 0:
+            vector = np.zeros(self.vector_size, dtype=np.float32)
+            vector_mask = np.zeros(self.vector_size, dtype=np.float32)
+        else:
+            vector = np.concatenate(vec_list, axis=0).astype(np.float32)
+            vector_mask = np.concatenate(mask_list, axis=0).astype(np.float32)
+
+        # 如果长度不够，补零
+        if len(vector) < self.vector_size:
+            pad_len = self.vector_size - len(vector)
+            vector = np.pad(vector, (0, pad_len), mode='constant', constant_values=0)
+            vector_mask = np.pad(vector_mask, (0, pad_len), mode='constant', constant_values=0)
+
+        return vector, vector_mask
+    
+    def _extract_screen(self, obs: Dict) -> np.ndarray:
+        """
+        提取屏幕特征层
+
+        处理流程：
+        1. 每层分别提取并 reshape 到 (H, W, 1)
+        2. 对 SCALAR 层按 scale 归一化到 [0,1]；对 CATEGORICAL 层保留标签值
+        3. 拼接成 (H, W, C) 并缩放到目标尺寸
+        """
+        layers = []
+        import re
+
+        def _get_layer_index(layer_feature):
+            if hasattr(layer_feature, "index"):
+                return layer_feature.index
+            try:
+                return int(layer_feature)
+            except Exception:
+                s = str(layer_feature)
+                m = re.search(r"(\d+)", s)
+                if m:
+                    return int(m.group(1))
+                raise RuntimeError(f"无法解析 screen layer feature: {layer_feature}")
+
+        for layer_feature, _name in self.config.screen_layers:
+            li = _get_layer_index(layer_feature)
+
+            # 如果 obs 中没有 feature_screen，直接报错
+            if "feature_screen" not in obs or obs.get("feature_screen") is None:
+                raise RuntimeError("observation missing 'feature_screen' while screen layers are requested")
+
+            fs = obs["feature_screen"]
+            if li < 0 or li >= fs.shape[0]:
+                raise RuntimeError(f"screen layer index {li} out of range for feature_screen with shape {fs.shape}")
+            layer_data = fs[li]
+
+            # 识别该层是 SCALAR 还是 CATEGORICAL（尽量使用 pysc2 的元信息）
+            f_type = None
+            try:
+                meta = features.SCREEN_FEATURES[li]
+                f_type = getattr(meta, "type", None)
+            except Exception:
+                f_type = getattr(layer_feature, "type", None)
+
+            is_categorical = False
+            if f_type is not None:
+                try:
+                    name = str(f_type).upper()
+                    if "CAT" in name:
+                        is_categorical = True
+                except Exception:
+                    is_categorical = False
+
+            # 处理数据
+            if is_categorical:
+                # CATEGORICAL: 保留原始标签值，建议在模型侧用 embedding/one-hot 处理
+                cdata = layer_data.astype(np.float32)
             else:
-                last_action = 0.0
+                # SCALAR: 按 scale 归一化到 [0,1]
+                scale = None
+                try:
+                    meta = features.SCREEN_FEATURES[li]
+                    scale = getattr(meta, "scale", None)
+                except Exception:
+                    scale = None
 
-            # control_groups数量
-            control_groups = np.asarray(getattr(obs, "control_groups", []))
-            ctrl_group_count = float(control_groups.shape[0]) if control_groups.size > 0 else 0.0
+                cdata = layer_data.astype(np.float32)
+                if scale is not None and scale > 1:
+                    cdata = cdata / float(scale - 1)
 
-            # alerts数量
-            alerts = np.asarray(getattr(obs, "alerts", []))
-            alerts_count = float(alerts.size)
+            # 注意：不在 parser 内置零，保留原始层值；mask 由 screen_layer_flags 提供
 
-            # 拼接所有特征
-            scalar_vec = np.array(
-                [map_id, game_loop_norm] + player_feats + score_feats +
-                [last_action, ctrl_group_count, alerts_count],
-                dtype=np.float32
-            )
-            return scalar_vec
-        except Exception as e:
-            logger.error(f"parse_scalar特征提取失败: {e}")
-            raise
+            # 添加通道维度并收集
+            cdata = np.expand_dims(cdata, axis=-1)
+            layers.append(cdata)
 
-    def resize_spatial(self, S: np.ndarray) -> np.ndarray:
-        """Resize spatial feature layers to (H, W)"""
-        C, h0, w0 = S.shape
-        out = np.zeros((C, self.H, self.W), dtype=S.dtype)
-        for i in range(C):
-            out[i] = cv2.resize(S[i], (self.W, self.H), interpolation=cv2.INTER_NEAREST)
-        return out
+        # 拼接所有层（若空则返回全零占位）
+        if len(layers) == 0:
+            screen = np.zeros((self.screen_size, self.screen_size, self.screen_channels), dtype=np.float32)
+        else:
+            screen = np.concatenate(layers, axis=-1)  # (H, W, C)
 
-    def scatter_connections(
-        self, coords: np.ndarray, ent_feats: np.ndarray
-    ) -> np.ndarray:
+        # 缩放到目标尺寸
+        screen = self._resize_spatial(screen, self.screen_size)
+
+        return screen.astype(np.float32)
+
+    # parser no longer exposes per-layer masks; gating is applied inside _extract_screen
+    
+    def _extract_minimap(self, obs: Dict) -> np.ndarray:
         """
-        直接将每个实体的特征scatter到空间网格，每个特征为一个通道。
-        ent_feats: [N, C_e]
-        返回: [C_e, H, W]
+        提取小地图特征层（与屏幕处理逻辑类似）
         """
-        C_e = ent_feats.shape[1]
-        grid = np.zeros((C_e, self.H, self.W), dtype=np.float32)
-        try:
-            for i, (x, y) in enumerate(coords):
-                if not (
-                    isinstance(x, (int, np.integer))
-                    and isinstance(y, (int, np.integer))
-                ):
-                    x, y = int(x), int(y)
-                if 0 <= x < self.W and 0 <= y < self.H:
-                    grid[:, y, x] += ent_feats[i]
-            return grid
-        except Exception as e:
-            logger.error(f"Error in scatter_connections: {str(e)} at coords index {i if 'i' in locals() else '?'}")
-            raise
+        layers = []
+        import re
 
-    def _prepare_screen_layers(self, layers: Optional[np.ndarray]) -> np.ndarray:
-        """Normalize screen layers to a fixed (3, H, W) tensor."""
-        screen_target = 3
-        if layers is None or np.size(layers) == 0:
-            return np.zeros((screen_target, self.H, self.W), dtype=np.float32)
-        layers = np.asarray(layers, dtype=np.float32)
-        resized = self.resize_spatial(layers)
-        if resized.size > 0:
-            resized = (resized - resized.mean(axis=(1, 2), keepdims=True)) / (
-                resized.std(axis=(1, 2), keepdims=True) + 1e-8
-            )
-        if resized.shape[0] < screen_target:
-            pad = np.zeros((screen_target - resized.shape[0], self.H, self.W), dtype=resized.dtype)
-            resized = np.concatenate([resized, pad], axis=0)
-        elif resized.shape[0] > screen_target:
-            resized = resized[:screen_target]
+        def _get_layer_index(layer_feature):
+            if hasattr(layer_feature, "index"):
+                return layer_feature.index
+            try:
+                return int(layer_feature)
+            except Exception:
+                s = str(layer_feature)
+                m = re.search(r"(\d+)", s)
+                if m:
+                    return int(m.group(1))
+                raise RuntimeError(f"无法解析 minimap layer feature: {layer_feature}")
+
+        for layer_feature, _name in self.config.minimap_layers:
+            li = _get_layer_index(layer_feature)
+
+            if "feature_minimap" not in obs or obs.get("feature_minimap") is None:
+                raise RuntimeError("observation missing 'feature_minimap' while minimap layers are requested")
+
+            mm = obs["feature_minimap"]
+            if li < 0 or li >= mm.shape[0]:
+                raise RuntimeError(f"minimap layer index {li} out of range for feature_minimap with shape {mm.shape}")
+            layer_data = mm[li]
+
+            # 判断类型
+            f_type = None
+            try:
+                meta = features.MINIMAP_FEATURES[li]
+                f_type = getattr(meta, "type", None)
+            except Exception:
+                f_type = getattr(layer_feature, "type", None)
+
+            is_categorical = False
+            if f_type is not None:
+                try:
+                    name = str(f_type).upper()
+                    if "CAT" in name:
+                        is_categorical = True
+                except Exception:
+                    is_categorical = False
+
+            if is_categorical:
+                cdata = layer_data.astype(np.float32)
+            else:
+                scale = None
+                try:
+                    meta = features.MINIMAP_FEATURES[li]
+                    scale = getattr(meta, "scale", None)
+                except Exception:
+                    scale = None
+
+                cdata = layer_data.astype(np.float32)
+                if scale is not None and scale > 1:
+                    cdata = cdata / float(scale - 1)
+
+            cdata = np.expand_dims(cdata, axis=-1)
+            layers.append(cdata)
+
+        if len(layers) == 0:
+            minimap = np.zeros((self.minimap_size, self.minimap_size, self.minimap_channels), dtype=np.float32)
+        else:
+            minimap = np.concatenate(layers, axis=-1)
+
+        minimap = self._resize_spatial(minimap, self.minimap_size)
+        return minimap.astype(np.float32)
+    
+    def _extract_available_actions(self, obs: Dict) -> np.ndarray:
+        """
+        提取可用动作
+        
+        【所有地图】：
+        - 从 obs["available_actions"] 获取可用的动作函数 ID 列表
+        - 转换为 one-hot 向量
+        
+        处理：创建长度为 len(FUNCTIONS) 的 one-hot 编码
+        """
+        available = np.zeros(self.num_actions, dtype=np.float32)
+        
+        if "available_actions" in obs:
+            for action_id in obs["available_actions"]:
+                if action_id < self.num_actions:
+                    available[action_id] = 1.0
+        
+        return available
+    
+    @staticmethod
+    def _resize_spatial(spatial: np.ndarray, target_size: int) -> np.ndarray:
+        """
+        缩放空间特征到目标尺寸（双线性插值）
+        
+        Args:
+            spatial: (H, W, C) 数组
+            target_size: 目标尺寸
+        
+        Returns:
+            (target_size, target_size, C) 数组
+        """
+        from scipy import ndimage
+        
+        h, w, c = spatial.shape
+        if h == target_size and w == target_size:
+            return spatial
+        
+        # 对每个通道分别缩放
+        scale = target_size / max(h, w)
+        resized_layers = []
+        
+        for i in range(c):
+            layer = spatial[:, :, i]
+            # 使用 zoom 进行缩放
+            zoom_factors = (scale, scale)
+            resized = ndimage.zoom(layer, zoom_factors, order=1)  # bilinear
+            resized_layers.append(resized)
+        
+        # 裁剪或补零到精确尺寸
+        resized = np.stack(resized_layers, axis=-1)
+        h_new, w_new = resized.shape[:2]
+        
+        if h_new > target_size or w_new > target_size:
+            resized = resized[:target_size, :target_size, :]
+        elif h_new < target_size or w_new < target_size:
+            pad_h = target_size - h_new
+            pad_w = target_size - w_new
+            resized = np.pad(resized, 
+                           ((0, pad_h), (0, pad_w), (0, 0)),
+                           mode='constant', constant_values=0)
+        
         return resized
 
-    def create_entity_embedding(self, entity_dict: dict) -> np.ndarray:
-        """
-        直接将归一化后的实体特征拼接，作为每个实体的特征向量，无learnable参数。
-        输出: [N_max, C_e]，C_e为特征数
-        """
-        N = self.N_max
-        # 归一化 type_ids, owner_ids
-        type_ids_norm = entity_dict["type_ids"].reshape(N, 1) / (max(self.unit_type_vocab.values()) + 1)
-        owner_ids_norm = entity_dict["owner_ids"].reshape(N, 1) / 4.0
-        ent_feats = entity_dict["ent_feats"]  # [N, D]
-        # 拼接所有特征
-        combined_features = np.concatenate([
-            type_ids_norm, owner_ids_norm, ent_feats
-        ], axis=1)  # [N, C_e]
-        # mask无效实体
-        mask = entity_dict["ent_mask"].reshape(N, 1)
-        return combined_features * mask  # [N, C_e]
 
-    def process_observation(self, obs: object) -> dict:
-        """
-        Runs full pipeline for one observation (minigame精简版)
-        空间融合采用：实体特征直接scatter到空间网格（每特征一通道），与feature_screen和可视mask拼接。
-        """
-        # 实体数据
-        e = self.parse_entities(obs)
-        # 标量数据
-        s = self.parse_scalar(obs)
-        # 空间融合数据（只用feature_screen）
-        screen_layers = obs.feature_screen
-        S_base = self._prepare_screen_layers(screen_layers)
-        ent_feats = self.create_entity_embedding(e)  # [N, C_e]
-        E_grid = self.scatter_connections(e["coords"], ent_feats)  # [C_e, H, W]
-        vis = np.zeros((1, self.H, self.W), dtype=np.float32)
-        for i, (x, y) in enumerate(e["coords"]):
-            if e["ent_mask"][i] > 0:
-                vis[0, y, x] = 1.0
-        spatial_fused = np.concatenate([S_base, E_grid, vis], axis=0)
+# ======================== 便捷函数 ========================
 
-        # 动作掩码（基于 FUNCTIONS），供上层策略使用
-        action_mask = np.zeros(self.action_vocab_size, dtype=np.float32)
-        avail = obs.available_actions
-        if avail is None:
-            logger.error("observation missing available_actions; ensure feature action space is enabled")
-            raise RuntimeError("observation missing available_actions; ensure feature action space is enabled")
-        try:
-            avail_iter = np.asarray(avail).flatten().tolist()
-        except Exception:
-            avail_iter = list(avail) if avail is not None else []
-        for fn_id in avail_iter:
-            try:
-                idx = int(fn_id)
-            except Exception:
-                continue
-            if 0 <= idx < self.action_vocab_size:
-                action_mask[idx] = 1.0
+def create_parser(map_name: str) -> ObsParser:
+    """创建 observation 解析器"""
+    return ObsParser(map_name)
 
-        return {
-            "entities": e,
-            "scalar": s,
-            "spatial_fused": spatial_fused,
-            "action_mask": action_mask,
+
+def parse_observations(obs_list: List[Dict], parser: ObsParser) -> Dict[str, np.ndarray]:
+    """
+    批量解析 observations（用于并行环境）
+    
+    Args:
+        obs_list: observation 列表
+        parser: ObsParser 实例
+    
+    Returns:
+        {
+            "vector": (B, vector_size),
+            "screen": (B, H, W, C),
+            "minimap": (B, H, W, C),
+            "available_actions": (B, num_actions),
+            "minimap_layer_flags": (B, minimap_channels),
+            "vector_mask": (B, vector_size),
         }
+    """
+    batch = {
+        "vector": [],
+        "screen": [],
+        "minimap": [],
+        "available_actions": [],
+        "screen_layer_flags": [],
+        "minimap_layer_flags": [],
+        "vector_mask": [],
+    }
+    
+    for obs in obs_list:
+        parsed = parser.parse(obs)
+        for key in batch.keys():
+            batch[key].append(parsed[key])
+    
+    # 堆叠成 batch
+    result = {}
+    for key in batch.keys():
+        result[key] = np.stack(batch[key], axis=0)
+    
+    return result
 
 
 if __name__ == "__main__":
-    from absl import flags
-    flags.FLAGS(['run'])
+    # 示例：打印 MoveToBeacon 的配置
+    parser = create_parser("MoveToBeacon")
+    print(f"Map: {parser.map_name}")
+    print("\nOutput Specification:")
+    for key, spec in parser.get_output_spec().items():
+        print(f"  {key}: {spec['shape']} {spec['dtype'].__name__}")
+        print(f"    {spec['desc']}")
+
+    # --- 运行一个短的 MoveToBeacon 实例并尝试解析 obs（带防护） ---
+    try:
+        # 解析 absl flags，避免 pysc2 在未 parse flags 时报错
+        from absl import flags
+        try:
+            flags.FLAGS(['prog', '--sc2_run_config=Windows'])
+        except Exception:
+            pass
+    except Exception:
+        pass
+
     try:
         from pysc2.env import sc2_env
-        from pysc2.lib import features
-    except ImportError as exc:
-        print(f"PySC2 import failed: {exc}. 请安装 pysc2 并设置好 SC2PATH。")
-        exit(1)
+        from pysc2.lib import actions, features as pysc2_features
+    except Exception as e:
+        print('\npysc2 not available or failed to import:', e)
+        print('Skipping runtime demo. If you want to run this, ensure StarCraft II and pysc2 are installed.')
+    else:
+        print('\nAttempting a short MoveToBeacon episode (32x32)...')
+        try:
+            with sc2_env.SC2Env(
+                map_name="MoveToBeacon",
+                players=[sc2_env.Agent(sc2_env.Race.terran)],
+                agent_interface_format=sc2_env.AgentInterfaceFormat(
+                    feature_dimensions=sc2_env.Dimensions(screen=32, minimap=32)
+                ),
+                step_mul=8,
+                game_steps_per_episode=0,
+                visualize=False,
+            ) as env:
+                timesteps = env.reset()
+                for _ in range(5):
+                    act = actions.FunctionCall(actions.FUNCTIONS.no_op.id, [])
+                    timesteps = env.step([act])
 
-    parser = ObsParser()
-    try:
-        with sc2_env.SC2Env(
-            map_name="MoveToBeacon",
-            players=[sc2_env.Agent(sc2_env.Race.terran)],
-            agent_interface_format=sc2_env.AgentInterfaceFormat(
-                feature_dimensions=features.Dimensions(screen=64, minimap=64),
-                use_feature_units=True,
-                action_space=sc2_env.ActionSpace.FEATURES,
-            ),
-            step_mul=8,
-            game_steps_per_episode=0,
-            visualize=False,
-        ) as env:
-            timestep = env.reset()[0]
-            obs = timestep.observation
-            result = parser.process_observation(obs)
-            print("[ObsParser] process_observation 输出：")
-            print("entities['ent_feats'] shape:", result["entities"]["ent_feats"].shape)
-            print("entities['coords'] shape:", result["entities"]["coords"].shape)
-            print("scalar shape:", result["scalar"].shape)
-            print("spatial_fused shape:", result["spatial_fused"].shape)
-            print("action_mask sum:", int(result["action_mask"].sum()))
-            print("action_mask nonzero idx:", np.nonzero(result["action_mask"])[0][:10], "...")
-            # 打印部分内容做 sanity check
-            print("scalar (前10):", result["scalar"][:10])
-            print("spatial_fused[0, :4, :4]:\n", result["spatial_fused"][0, :4, :4])
-    except Exception as exc:
-        print(f"[ObsParser] 测试失败: {exc}")
-        print("请确保 StarCraft II 已安装且 SC2PATH 设置正确。")
+                last = timesteps[0].observation
+                print('Observation keys:', list(last.keys()))
+                try:
+                    parsed = parser.parse(last)
+                    print('Parsed keys:', list(parsed.keys()))
+                    print('vector shape:', parsed['vector'].shape)
+                    print('screen shape:', parsed['screen'].shape)
+                    print('minimap shape:', parsed['minimap'].shape)
+                    print('available_actions sum:', float(parsed['available_actions'].sum()))
+                    print('screen_layer_flags:', parsed['screen_layer_flags'])
+                    print('minimap_layer_flags:', parsed['minimap_layer_flags'])
+                    print('vector_mask:', parsed['vector_mask'])
+                except Exception as e:
+                    print('Parser error while handling observation:', e)
+                    import traceback
+                    traceback.print_exc()
+        except Exception as e:
+            print('Error running SC2 env (ensure SC2 and replays are installed):', e)
+            import traceback
+            traceback.print_exc()
