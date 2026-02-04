@@ -12,7 +12,7 @@ env_kwargs:
   minimap_size: 32
   step_mul: 8
   visualize: false
-total_timesteps: 1000000     # 总训练步数，建议10万~100万
+total_timesteps: 100000     # 总训练步数，建议10万~100万
 learning_rate: 2.5e-4        # 学习率，PPO常用
 ent_coef: 0.01               # 策略熵系数，鼓励探索
 batch_size: 256              # 每次更新的batch，建议128~1024
@@ -23,3 +23,17 @@ n_steps: 2048                # 每个环境采样步数，建议512~4096
 clip_range: 0.2              # PPO裁剪范围
 vf_coef: 0.5                 # value loss系数
 max_grad_norm: 0.5           # 梯度裁剪
+
+# === 评估（Eval）设置 ===
+eval_freq: 10000            # 评估频率（timesteps），EvalCallback 会按此频率运行评估
+n_eval_episodes: 5         # 每次评估的 episode 数
+eval_deterministic: true   # 评估时是否使用确定性策略
+eval_render: false         # 评估时是否渲染（通常设置为 false）
+
+# === TensorBoard / 日志 ===
+tensorboard: true          # 是否启用 TensorBoard 日志（train.py 会在 models/<ts>/tb_logs 写入）
+tb_log_dir: tb_logs        # 相对于输出目录的 TB 日志子目录
+
+# === 保存 / 输出行为 ===
+save_best_model: true      # 是否保存表现最好的模型（由 EvalCallback 实现）
+verbose: 1                 # SB3 的 verbose 级别

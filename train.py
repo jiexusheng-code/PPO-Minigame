@@ -43,9 +43,18 @@ def main():
         "learning_rate", "ent_coef", "batch_size", "n_epochs", "gamma", "gae_lambda", "n_steps", "clip_range", "vf_coef", "max_grad_norm"
     ]
     ppo_kwargs = {k: cfg[k] for k in ppo_param_keys if k in cfg}
+    # 读取评估/日志相关配置
+    eval_freq = cfg.get("eval_freq", 10000)
+    n_eval_episodes = cfg.get("n_eval_episodes", 5)
+    eval_deterministic = cfg.get("eval_deterministic", True)
+    eval_render = cfg.get("eval_render", False)
+    tensorboard = cfg.get("tensorboard", True)
+    tb_log_dirname = cfg.get("tb_log_dir", "tb_logs")
+    save_best_model = cfg.get("save_best_model", True)
+    verbose_level = cfg.get("verbose", 1)
     env_fn = make_env_fn(env_name, env_kwargs)
     vec_env = make_vec_env(env_fn, n_envs=n_envs, seed=seed, wrapper_class=Monitor)
-    tb_log = os.path.join(base_dir, "tb_logs")
+    tb_log = os.path.join(base_dir, tb_log_dirname) if tensorboard else None
     log_dir = os.path.join(base_dir, "logs")
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, "train.log")
@@ -80,19 +89,22 @@ def main():
         logger.info(f"[INFO] 从checkpoint加载模型: {checkpoint_path}")
         model = PPO.load(checkpoint_path, env=vec_env, tensorboard_log=tb_log, policy=policy, policy_kwargs=policy_kwargs, **ppo_kwargs)
     else:
-        model = PPO(policy, vec_env, verbose=1, tensorboard_log=tb_log, policy_kwargs=policy_kwargs, **ppo_kwargs)
+        model = PPO(policy, vec_env, verbose=verbose_level, tensorboard_log=tb_log, policy_kwargs=policy_kwargs, **ppo_kwargs)
     # 使用EvalCallback只保存表现最好的模型
     eval_env = make_vec_env(env_fn, n_envs=1, seed=seed+100, wrapper_class=Monitor)
+    best_model_save_path = out_dir if save_best_model else None
     eval_callback = EvalCallback(
         eval_env,
-        best_model_save_path=out_dir,
+        best_model_save_path=best_model_save_path,
         log_path=out_dir,
-        eval_freq=10000,
-        deterministic=True,
-        render=False,
-        n_eval_episodes=5
+        eval_freq=eval_freq,
+        deterministic=eval_deterministic,
+        render=eval_render,
+        n_eval_episodes=n_eval_episodes
     )
     logger.info(f"开始训练，总步数: {total_timesteps}")
+    logger.info(f"评估频率(eval_freq): {eval_freq}, 每次评估episode数: {n_eval_episodes}, 保存最佳模型: {save_best_model}")
+    logger.info(f"TensorBoard: {'启用' if tensorboard and tb_log else '禁用'}, TB目录: {tb_log}")
     model.learn(total_timesteps=total_timesteps, callback=eval_callback)
     logger.info("训练完成，保存最终模型...")
     model.save(os.path.join(out_dir, f"final_model_{today_str}"))
