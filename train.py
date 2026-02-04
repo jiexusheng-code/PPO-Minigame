@@ -7,7 +7,7 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import EvalCallback
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.monitor import Monitor
-from src.policies.masked_flatten_policy import MaskedFlattenPolicy
+from src.policies.masked_flatten_policy import MaskedFlattenPolicy, VectorLayerNormExtractor
 
 DEFAULT_CONFIG_PATH = "./configs/ppo_config.yaml"
 
@@ -35,6 +35,8 @@ def main():
     total_timesteps = cfg.get("total_timesteps", 100000)
     policy = MaskedFlattenPolicy if cfg.get("policy", "MaskedFlattenPolicy") == "MaskedFlattenPolicy" else cfg["policy"]
     policy_kwargs = cfg.get("policy_kwargs", {})
+    if policy is MaskedFlattenPolicy and "features_extractor_class" not in policy_kwargs:
+        policy_kwargs["features_extractor_class"] = VectorLayerNormExtractor
     env_kwargs = cfg.get("env_kwargs", {})
     os.makedirs(out_dir, exist_ok=True)
     ppo_param_keys = [

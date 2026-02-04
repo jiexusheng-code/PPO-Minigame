@@ -48,14 +48,14 @@ class PySC2GymEnv(gym.Env):
         self.features = features
         if self.map_name is None:
             raise ValueError("map_name 不能为空，需与 ObsParser 配置一致")
-        self._parser: ObsParser = ObsParser(self.map_name)
+        self._parser: ObsParser = ObsParser(self.map_name, screen_size=self.screen_size, minimap_size=self.minimap_size)
         self._env = None
         self.observation_space = None
         self.action_space = None
         self._max_args = 0
         self.timestep = None  # 维护当前timestep
-        self._build_action_space()
         self._lazy_init()
+        self._build_action_space()
         initial_ts = self._env.reset()
         self.timestep = initial_ts[0]
         parsed = self._parser.parse(self.timestep.observation)
@@ -64,6 +64,10 @@ class PySC2GymEnv(gym.Env):
 
     def _build_action_space(self):
         try:
+            if self._env is None:
+                raise RuntimeError("Env not initialized before building action space")
+            action_spec = self._env.action_spec()[0]
+            self._action_spec_types = action_spec.types
             n_funcs = len(self.actions.FUNCTIONS)
             # 1. 收集所有参数语义（唯一槽位）
             param_semantics = []  # 语义唯一的参数名列表
@@ -77,10 +81,12 @@ class PySC2GymEnv(gym.Env):
                         param_semantics.append(name)
                         param_semantics_set.add(name)
                     if getattr(spec, "sizes", None):
-                        if any(k in name for k in ["screen", "screen2"]):
-                            size = 84*84
-                        elif "minimap" in name: 
-                            size = 64*64
+                        if name in self._action_spec_types._fields:
+                            sizes = getattr(self._action_spec_types, name).sizes
+                            if len(sizes) >= 2:
+                                size = int(sizes[0]) * int(sizes[1])
+                            else:
+                                size = int(sizes[0])
                         else:
                             size = int(spec.sizes[0])
                     if name not in param_size_dict or size > param_size_dict[name]:
@@ -214,17 +220,17 @@ class PySC2GymEnv(gym.Env):
                 except Exception:
                     raise RuntimeError(f"参数类型错误: fn_id={fn_id}, 参数{name}, 槽位={slot}, raw_val={raw_val}")
 
-                if "minimap" in name:
-                    max_flat = 64 * 64
+                if name in self._action_spec_types._fields:
+                    sizes = getattr(self._action_spec_types, name).sizes
+                else:
+                    sizes = sizes
+
+                if name in ["minimap", "screen", "screen2"] and len(sizes) >= 2:
+                    h, w = int(sizes[0]), int(sizes[1])
+                    max_flat = h * w
                     if not (0 <= raw_int < max_flat):
                         raise ValueError(f"参数越界: fn_id={fn_id}, 参数{name}, 槽位={slot}, raw_val={raw_val}")
-                    y, x = divmod(raw_int, 64)
-                    args.append([x, y])
-                elif "screen" in name or "screen2" in name:
-                    max_flat = 84 * 84
-                    if not (0 <= raw_int < max_flat):
-                        raise ValueError(f"参数越界: fn_id={fn_id}, 参数{name}, 槽位={slot}, raw_val={raw_val}")
-                    y, x = divmod(raw_int, 84)
+                    y, x = divmod(raw_int, w)
                     args.append([x, y])
                 else:
                     size = int(sizes[0]) if len(sizes) > 0 else 1

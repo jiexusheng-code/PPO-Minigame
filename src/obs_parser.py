@@ -103,10 +103,12 @@ class ObsParser:
     将原始 observation 转化为固定结构、可跨地图使用的状态表示
     """
     
-    def __init__(self, map_name: str):
+    def __init__(self, map_name: str, screen_size: int | None = None, minimap_size: int | None = None):
         """
         Args:
             map_name: 地图名称（如 "MoveToBeacon"）
+            screen_size: 可选，覆盖配置中的屏幕尺寸
+            minimap_size: 可选，覆盖配置中的小地图尺寸
         """
         if map_name not in AVAILABLE_MAPS:
             raise ValueError(
@@ -116,9 +118,9 @@ class ObsParser:
         self.map_name = map_name
         self.config = AVAILABLE_MAPS[map_name]()
         
-        # 从配置中获取尺寸参数
-        self.screen_size = self.config.screen_size
-        self.minimap_size = self.config.minimap_size
+        # 从配置中获取尺寸参数（可被外部覆盖）
+        self.screen_size = screen_size if screen_size is not None else self.config.screen_size
+        self.minimap_size = minimap_size if minimap_size is not None else self.config.minimap_size
         
         # 向量使用规范长度（canonical），便于跨地图复用与有效性掩码
         # 默认采用 SC2 player 向量中的 11 个字段作为规范长度
@@ -496,9 +498,9 @@ class ObsParser:
 
 # ======================== 便捷函数 ========================
 
-def create_parser(map_name: str) -> ObsParser:
+def create_parser(map_name: str, screen_size: int | None = None, minimap_size: int | None = None) -> ObsParser:
     """创建 observation 解析器"""
-    return ObsParser(map_name)
+    return ObsParser(map_name, screen_size=screen_size, minimap_size=minimap_size)
 
 
 def parse_observations(obs_list: List[Dict], parser: ObsParser) -> Dict[str, np.ndarray]:
