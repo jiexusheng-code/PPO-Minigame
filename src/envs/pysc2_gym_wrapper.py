@@ -16,8 +16,8 @@ class PySC2GymEnv(gym.Env):
     def __init__(
         self,
         map_name: str = None,
-        screen_size: int = 64,
-        minimap_size: int = 64,
+        screen_size: int = 32,
+        minimap_size: int = 32,
         step_mul: int = 8,
         visualize: bool = False,
     ):
@@ -38,7 +38,7 @@ class PySC2GymEnv(gym.Env):
             from pysc2.lib import actions, features
             from absl import flags
             if not flags.FLAGS.is_parsed():
-                flags.FLAGS(["pysc2_env"])
+                flags.FLAGS(["pysc2_env", "--sc2_run_config=Windows"])
         except Exception as exc:
             self.logger.error(f"无法导入 pysc2，请确保已正确安装。错误详情: {exc}")
             raise RuntimeError(f"无法导入 pysc2，请确保已正确安装。错误详情: {exc}") from exc
@@ -46,7 +46,9 @@ class PySC2GymEnv(gym.Env):
         self.sc2_env = sc2_env
         self.actions = actions
         self.features = features
-        self._parser: ObsParser = ObsParser(H=self.screen_size, W=self.screen_size)
+        if self.map_name is None:
+            raise ValueError("map_name 不能为空，需与 ObsParser 配置一致")
+        self._parser: ObsParser = ObsParser(self.map_name)
         self._env = None
         self.observation_space = None
         self.action_space = None
@@ -56,7 +58,7 @@ class PySC2GymEnv(gym.Env):
         self._lazy_init()
         initial_ts = self._env.reset()
         self.timestep = initial_ts[0]
-        parsed = self._parser.process_observation(self.timestep.observation)
+        parsed = self._parser.parse(self.timestep.observation)
         parsed_flat = self._flatten_parsed(parsed)
         self._build_observation_space_from_parser(parsed_flat)
 
@@ -122,42 +124,33 @@ class PySC2GymEnv(gym.Env):
 
     def _build_observation_space_from_parser(self, parsed: Dict[str, object]):
         spaces: Dict[str, gym.Space] = {}
-        # spatial_fused
-        spatial = parsed.get("spatial_fused")
-        if spatial is not None:
-            c, h, w = spatial.shape
-            spaces["spatial_fused"] = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(c, h, w), dtype=np.float32)
-        # scalar_vec（obs_parser输出直接是np.ndarray，flatten后key为scalar_vec）
-        scalar_vec = parsed.get("scalar_vec")
-        if scalar_vec is not None:
-            spaces["scalar_vec"] = gym.spaces.Box(low=-np.inf, high=np.inf, shape=scalar_vec.shape, dtype=scalar_vec.dtype)
-        # entities
-        N = getattr(self._parser, "N_max", 512)
-        type_ids = parsed.get("type_ids")
-        if type_ids is not None:
-            spaces["type_ids"] = gym.spaces.Box(low=0, high=1e6, shape=(N,), dtype=np.int64)
-        owner_ids = parsed.get("owner_ids")
-        if owner_ids is not None:
-            spaces["owner_ids"] = gym.spaces.Box(low=0, high=10, shape=(N,), dtype=np.int64)
-        ent_feats = parsed.get("ent_feats")
-        if ent_feats is not None:
-            spaces["ent_feats"] = gym.spaces.Box(low=-np.inf, high=np.inf, shape=ent_feats.shape, dtype=np.float32)
-        ent_mask = parsed.get("ent_mask")
-        if ent_mask is not None:
-            spaces["ent_mask"] = gym.spaces.Box(low=0.0, high=1.0, shape=(N,), dtype=np.float32)
-        coords = parsed.get("coords")
-        if coords is not None:
-            spaces["coords"] = gym.spaces.Box(low=0, high=self.screen_size, shape=(N, 2), dtype=np.int32)
-        # action_mask
-        action_mask = parsed.get("action_mask")
-        if action_mask is not None:
-            spaces["action_mask"] = gym.spaces.Box(low=0.0, high=1.0, shape=action_mask.shape, dtype=np.float32)
+        vector = parsed.get("vector")
+        if vector is not None:
+            spaces["vector"] = gym.spaces.Box(low=-np.inf, high=np.inf, shape=vector.shape, dtype=np.float32)
+        screen = parsed.get("screen")
+        if screen is not None:
+            spaces["screen"] = gym.spaces.Box(low=-np.inf, high=np.inf, shape=screen.shape, dtype=np.float32)
+        minimap = parsed.get("minimap")
+        if minimap is not None:
+            spaces["minimap"] = gym.spaces.Box(low=-np.inf, high=np.inf, shape=minimap.shape, dtype=np.float32)
+        available_actions = parsed.get("available_actions")
+        if available_actions is not None:
+            spaces["available_actions"] = gym.spaces.Box(low=0.0, high=1.0, shape=available_actions.shape, dtype=np.float32)
+        screen_layer_flags = parsed.get("screen_layer_flags")
+        if screen_layer_flags is not None:
+            spaces["screen_layer_flags"] = gym.spaces.Box(low=0.0, high=1.0, shape=screen_layer_flags.shape, dtype=np.float32)
+        minimap_layer_flags = parsed.get("minimap_layer_flags")
+        if minimap_layer_flags is not None:
+            spaces["minimap_layer_flags"] = gym.spaces.Box(low=0.0, high=1.0, shape=minimap_layer_flags.shape, dtype=np.float32)
+        vector_mask = parsed.get("vector_mask")
+        if vector_mask is not None:
+            spaces["vector_mask"] = gym.spaces.Box(low=0.0, high=1.0, shape=vector_mask.shape, dtype=np.float32)
         self.observation_space = gym.spaces.Dict(spaces)
 
     def _obs_to_space(self, timestep) -> Dict[str, Any]:
         raw_obs = timestep.observation
         #print("DEBUG: observation fields:", dir(raw_obs))
-        parsed = self._parser.process_observation(raw_obs)
+        parsed = self._parser.parse(raw_obs)
         parsed_flat = self._flatten_parsed(parsed)
         if self.observation_space is None:
             self._build_observation_space_from_parser(parsed_flat)
@@ -172,23 +165,13 @@ class PySC2GymEnv(gym.Env):
                 out[name] = np.array(val, dtype=dtype, copy=False)
             except Exception:
                 return
-        # flatten spatial_fused
-        if "spatial_fused" in parsed:
-            _add("spatial_fused", parsed["spatial_fused"], np.float32)
-        # flatten scalar（obs_parser输出直接是np.ndarray，不是dict）
-        if "scalar" in parsed and parsed["scalar"] is not None:
-            _add("scalar_vec", parsed["scalar"], np.float32)
-        # flatten entities
-        entities = parsed.get("entities", {}) if isinstance(parsed.get("entities", {}), dict) else {}
-        if entities:
-            _add("type_ids", entities.get("type_ids"), np.int64)
-            _add("owner_ids", entities.get("owner_ids"), np.int64)
-            _add("ent_feats", entities.get("ent_feats"), np.float32)
-            _add("ent_mask", entities.get("ent_mask"), np.float32)
-            _add("coords", entities.get("coords"), np.int32)
-        # flatten action_mask
-        if "action_mask" in parsed:
-            _add("action_mask", parsed["action_mask"], np.float32)
+        _add("vector", parsed.get("vector"), np.float32)
+        _add("screen", parsed.get("screen"), np.float32)
+        _add("minimap", parsed.get("minimap"), np.float32)
+        _add("available_actions", parsed.get("available_actions"), np.float32)
+        _add("screen_layer_flags", parsed.get("screen_layer_flags"), np.float32)
+        _add("minimap_layer_flags", parsed.get("minimap_layer_flags"), np.float32)
+        _add("vector_mask", parsed.get("vector_mask"), np.float32)
         return out
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
@@ -259,12 +242,12 @@ class PySC2GymEnv(gym.Env):
         fn_id, raw_params = self._unwrap_action(action)
         # 用self.timestep获取当前观测
         obs_raw = self.timestep.observation
-        parsed_now = self._parser.process_observation(obs_raw)
+        parsed_now = self._parser.parse(obs_raw)
         parsed_flat_now = self._flatten_parsed(parsed_now)
-        action_mask = parsed_flat_now.get("action_mask")
+        action_mask = parsed_flat_now.get("available_actions")
         if action_mask is None:
-            logger.error("action_mask missing; cannot determine available actions")
-            raise RuntimeError("action_mask missing; cannot determine available actions")
+            self.logger.error("available_actions missing; cannot determine available actions")
+            raise RuntimeError("available_actions missing; cannot determine available actions")
         available = np.nonzero(np.asarray(action_mask).reshape(-1))[0].tolist()
 
         args, clipped = self._sanitize_params(fn_id, raw_params)
