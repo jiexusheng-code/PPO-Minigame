@@ -281,10 +281,10 @@ class PySC2GymEnv(gym.Env):
         truncated = False
         info = {"arg_clipped": clipped, "fn_available": fn_id in available}
         
-        self.logger.info(f"Step {self._step_count}")
-        self.logger.info(f"  Agent raw action: fn_id={fn_id}, raw_params={raw_params}")
-        self.logger.info(f"  Executed action: fn_id={exec_fn_id}, args={exec_args}")
-        self.logger.info(f"  Available actions: {len(available)}, reward={reward:.3f}, terminated={terminated}, clipped={clipped}")
+        self.logger.debug(f"Step {self._step_count}")
+        self.logger.debug(f"  Agent raw action: fn_id={fn_id}, raw_params={raw_params}")
+        self.logger.debug(f"  Executed action: fn_id={exec_fn_id}, args={exec_args}")
+        self.logger.debug(f"  Available actions: {len(available)}, reward={reward:.3f}, terminated={terminated}, clipped={clipped}")
         return obs, reward, terminated, truncated, info
 
     def render(self, mode="human"):

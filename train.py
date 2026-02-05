@@ -85,7 +85,6 @@ def main():
         logger.info(f"PyTorch 当前设备: {device_str}")
     except Exception as e:
         logger.warning(f"无法检测PyTorch设备: {e}")
-
     device = "auto"
     checkpoint_path = cfg.get("checkpoint_path", None)
     if checkpoint_path and os.path.isfile(checkpoint_path):
@@ -110,7 +109,7 @@ def main():
             result = super()._on_step()
             if do_eval:
                 self._logger.info(
-                    f"[EvalCallback] 评估完成: num_timesteps={self.num_timesteps}, last_mean_reward={self.last_mean_reward}, last_mean_ep_length={self.last_mean_ep_length}"
+                    f"[EvalCallback] 评估完成: num_timesteps={self.num_timesteps}, last_mean_reward={self.last_mean_reward}"
                 )
             return result
 
