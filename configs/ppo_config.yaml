@@ -13,8 +13,8 @@ env_kwargs:
   step_mul: 8
   visualize: false
 total_timesteps: 100000      # 总训练步数，建议10万~100万
-learning_rate: 5.0e-5        # 学习率，PPO常用
-ent_coef: 0.03               # 策略熵系数，鼓励探索
+learning_rate: 1.5e-4        # 学习率，PPO常用
+ent_coef: 0.02               # 策略熵系数，鼓励探索
 batch_size: 512              # 每次更新的batch，建议128~1024
 n_epochs: 10                 # 每轮更新的epoch数
 gamma: 0.99                  # 折扣因子
@@ -33,6 +33,7 @@ eval_render: false          # 评估时是否渲染（通常设置为 false）
 # === TensorBoard / 日志 ===
 tensorboard: true          # 是否启用 TensorBoard 日志（train.py 会在 models/<ts>/tb_logs 写入）
 tb_log_dir: tb_logs        # 相对于输出目录的 TB 日志子目录
+log_interval: 1           # 学习更新的日志间隔（默认 1），会传递给 model.learn(...)
 
 # === 保存 / 输出行为 ===
 save_best_model: true      # 是否保存表现最好的模型（由 EvalCallback 实现）

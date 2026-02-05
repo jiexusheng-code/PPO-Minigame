@@ -129,7 +129,10 @@ def main():
     logger.info(f"开始训练，总步数: {total_timesteps}")
     logger.info(f"评估频率(eval_freq): {eval_freq}, 每次评估episode数: {n_eval_episodes}, 保存最佳模型: {save_best_model}")
     logger.info(f"TensorBoard: {'启用' if tensorboard and tb_log else '禁用'}, TB目录: {tb_log}")
-    model.learn(total_timesteps=total_timesteps, callback=eval_callback)
+    # 日志/打印间隔（多少次学习更新写一次日志）
+    log_interval = cfg.get("log_interval", 1)
+    logger.info(f"日志间隔(log_interval): {log_interval}")
+    model.learn(total_timesteps=total_timesteps, callback=eval_callback, log_interval=log_interval)
     logger.info("训练完成，保存最终模型...")
     model.save(os.path.join(out_dir, f"final_model_{today_str}"))
     def _sanitize_for_yaml(obj):
