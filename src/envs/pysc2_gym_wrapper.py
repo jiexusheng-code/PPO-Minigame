@@ -38,7 +38,8 @@ class PySC2GymEnv(gym.Env):
             from pysc2.lib import actions, features
             from absl import flags
             if not flags.FLAGS.is_parsed():
-                flags.FLAGS(["pysc2_env", "--sc2_run_config=Windows"])
+                run_config = "Linux" if os.name != "nt" else "Windows"
+                flags.FLAGS(["pysc2_env", f"--sc2_run_config={run_config}"])
         except Exception as exc:
             self.logger.error(f"无法导入 pysc2，请确保已正确安装。错误详情: {exc}")
             raise RuntimeError(f"无法导入 pysc2，请确保已正确安装。错误详情: {exc}") from exc
@@ -125,7 +126,8 @@ class PySC2GymEnv(gym.Env):
             step_mul=self.step_mul,
             game_steps_per_episode=0,
             visualize=self.visualize,
-            ensure_available_actions=True
+            ensure_available_actions=True,
+            score_index=0,
         )
 
     def _build_observation_space_from_parser(self, parsed: Dict[str, object]):

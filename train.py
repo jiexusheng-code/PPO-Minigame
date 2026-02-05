@@ -84,12 +84,14 @@ def main():
         logger.info(f"PyTorch 当前设备: {device_str}")
     except Exception as e:
         logger.warning(f"无法检测PyTorch设备: {e}")
+
+    device = "auto"
     checkpoint_path = cfg.get("checkpoint_path", None)
     if checkpoint_path and os.path.isfile(checkpoint_path):
         logger.info(f"[INFO] 从checkpoint加载模型: {checkpoint_path}")
-        model = PPO.load(checkpoint_path, env=vec_env, tensorboard_log=tb_log, policy=policy, policy_kwargs=policy_kwargs, **ppo_kwargs)
+        model = PPO.load(checkpoint_path, env=vec_env, tensorboard_log=tb_log, policy=policy, policy_kwargs=policy_kwargs, device=device, **ppo_kwargs)
     else:
-        model = PPO(policy, vec_env, verbose=verbose_level, tensorboard_log=tb_log, policy_kwargs=policy_kwargs, **ppo_kwargs)
+        model = PPO(policy, vec_env, verbose=verbose_level, tensorboard_log=tb_log, policy_kwargs=policy_kwargs, device=device, **ppo_kwargs)
     # 使用EvalCallback只保存表现最好的模型
     eval_env = make_vec_env(env_fn, n_envs=1, seed=seed+100, wrapper_class=Monitor)
     best_model_save_path = out_dir if save_best_model else None
@@ -108,8 +110,17 @@ def main():
     model.learn(total_timesteps=total_timesteps, callback=eval_callback)
     logger.info("训练完成，保存最终模型...")
     model.save(os.path.join(out_dir, f"final_model_{today_str}"))
+    def _sanitize_for_yaml(obj):
+        if isinstance(obj, dict):
+            return {k: _sanitize_for_yaml(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [ _sanitize_for_yaml(v) for v in obj ]
+        if isinstance(obj, type):
+            return f"{obj.__module__}.{obj.__name__}"
+        return obj
+
     with open(os.path.join(out_dir, "config_used.yaml"), "w", encoding="utf-8") as f:
-        yaml.safe_dump(cfg, f)
+        yaml.safe_dump(_sanitize_for_yaml(cfg), f, allow_unicode=True)
     logger.info("配置已保存: config_used.yaml")
 
 if __name__ == "__main__":

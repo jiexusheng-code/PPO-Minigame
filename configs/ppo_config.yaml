@@ -26,8 +26,8 @@ max_grad_norm: 0.5           # 梯度裁剪
 
 # === 评估（Eval）设置 ===
 eval_freq: 10000            # 评估频率（timesteps），EvalCallback 会按此频率运行评估
-n_eval_episodes: 5         # 每次评估的 episode 数
-eval_deterministic: true   # 评估时是否使用确定性策略
+n_eval_episodes: 20         # 每次评估的 episode 数
+eval_deterministic: false   # 评估时是否使用确定性策略
 eval_render: false         # 评估时是否渲染（通常设置为 false）
 
 # === TensorBoard / 日志 ===

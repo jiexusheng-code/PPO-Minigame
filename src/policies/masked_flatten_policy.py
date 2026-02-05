@@ -21,10 +21,6 @@ class VectorLayerNormExtractor(BaseFeaturesExtractor):
     def __init__(self, observation_space, cnn_output_dim: int = 256):
         spaces = getattr(observation_space, "spaces", {})
 
-        self._vector_ln = None
-        if "vector" in spaces:
-            self._vector_ln = nn.LayerNorm(get_flattened_obs_dim(spaces["vector"]))
-
         self._screen_layers = [
             (features.ScreenFeatures.visibility_map, "visibility_map"),
             (features.ScreenFeatures.player_relative, "player_relative"),
@@ -50,16 +46,6 @@ class VectorLayerNormExtractor(BaseFeaturesExtractor):
             self._minimap_layers, features.MINIMAP_FEATURES
         )
 
-        self._screen_embeddings = nn.ModuleList([
-            nn.Embedding(num, dim) for _, num, dim in self._screen_cat_info
-        ])
-        self._minimap_embeddings = nn.ModuleList([
-            nn.Embedding(num, dim) for _, num, dim in self._minimap_cat_info
-        ])
-
-        self._screen_cnn, screen_out_dim = self._build_cnn(spaces.get("screen"), self._screen_in_channels, cnn_output_dim)
-        self._minimap_cnn, minimap_out_dim = self._build_cnn(spaces.get("minimap"), self._minimap_in_channels, cnn_output_dim)
-
         self._flat_keys = []
         flat_dim = 0
         for key in ["available_actions", "screen_layer_flags", "minimap_layer_flags", "vector_mask"]:
@@ -67,8 +53,27 @@ class VectorLayerNormExtractor(BaseFeaturesExtractor):
                 self._flat_keys.append(key)
                 flat_dim += get_flattened_obs_dim(spaces[key])
 
-        total_dim = flat_dim + screen_out_dim + minimap_out_dim
+        vector_dim = get_flattened_obs_dim(spaces["vector"]) if "vector" in spaces else 0
+
+        screen_out_dim = self._expected_cnn_out_dim(spaces.get("screen"), cnn_output_dim)
+        minimap_out_dim = self._expected_cnn_out_dim(spaces.get("minimap"), cnn_output_dim)
+
+        total_dim = vector_dim + flat_dim + screen_out_dim + minimap_out_dim
         super().__init__(observation_space, features_dim=total_dim)
+
+        self._vector_ln = None
+        if "vector" in spaces:
+            self._vector_ln = nn.LayerNorm(get_flattened_obs_dim(spaces["vector"]))
+
+        self._screen_embeddings = nn.ModuleList([
+            nn.Embedding(num, dim) for _, num, dim in self._screen_cat_info
+        ])
+        self._minimap_embeddings = nn.ModuleList([
+            nn.Embedding(num, dim) for _, num, dim in self._minimap_cat_info
+        ])
+
+        self._screen_cnn, _screen_out_dim = self._build_cnn(spaces.get("screen"), self._screen_in_channels, cnn_output_dim)
+        self._minimap_cnn, _minimap_out_dim = self._build_cnn(spaces.get("minimap"), self._minimap_in_channels, cnn_output_dim)
 
         self._flatten = nn.Flatten()
 
@@ -135,6 +140,15 @@ class VectorLayerNormExtractor(BaseFeaturesExtractor):
             flat_dim = cnn(dummy).shape[1]
         fc = nn.Linear(flat_dim, cnn_output_dim)
         return nn.Sequential(cnn, fc, nn.ReLU()), cnn_output_dim
+
+    @staticmethod
+    def _expected_cnn_out_dim(space, cnn_output_dim: int) -> int:
+        if space is None:
+            return 0
+        shape = getattr(space, "shape", None)
+        if shape is None or len(shape) != 3:
+            return 0
+        return cnn_output_dim
 
     def _apply_channel_flags(self, x: torch.Tensor, flags: torch.Tensor) -> torch.Tensor:
         if flags is None:
@@ -234,3 +248,11 @@ class MaskedFlattenPolicy(MultiInputPolicy):
 
         log_prob = distribution.log_prob(actions)
         return actions, values, log_prob
+
+    def get_distribution(self, obs):
+        features = self.extract_features(obs)
+        latent_pi, _ = self.mlp_extractor(features)
+        logits = self.action_net(latent_pi)
+        if isinstance(self.action_dist, MultiCategoricalDistribution) and "available_actions" in obs:
+            logits = self._apply_action_mask(logits, obs["available_actions"])
+        return self.action_dist.proba_distribution(logits)
