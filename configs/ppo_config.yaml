@@ -1,7 +1,7 @@
 env: MoveToBeacon
 out_dir: ./models
 checkpoint_path: 
-n_envs: 4                    # 并行环境的数量，也就是同时跑多少个环境实例来采样数据。值越大，采样效率通常更高，但会占用更多 CPU/GPU 和内存资源。
+n_envs: 8                    # 并行环境的数量，也就是同时跑多少个环境实例来采样数据。值越大，采样效率通常更高，但会占用更多 CPU/GPU 和内存资源。
 seed: 0
 policy: MaskedFlattenPolicy
 policy_kwargs:
@@ -12,15 +12,15 @@ env_kwargs:
   minimap_size: 32
   step_mul: 8
   visualize: false
-total_timesteps: 100000     # 总训练步数，建议10万~100万
-learning_rate: 2.5e-4        # 学习率，PPO常用
-ent_coef: 0.01               # 策略熵系数，鼓励探索
-batch_size: 256              # 每次更新的batch，建议128~1024
+total_timesteps: 100000      # 总训练步数，建议10万~100万
+learning_rate: 1.5e-4        # 学习率，PPO常用
+ent_coef: 0.02               # 策略熵系数，鼓励探索
+batch_size: 512              # 每次更新的batch，建议128~1024
 n_epochs: 10                 # 每轮更新的epoch数
 gamma: 0.99                  # 折扣因子
 gae_lambda: 0.95             # GAE参数
 n_steps: 2048                # 每个环境采样步数，建议512~4096
-clip_range: 0.2              # PPO裁剪范围
+clip_range: 0.15             # PPO裁剪范围
 vf_coef: 0.5                 # value loss系数
 max_grad_norm: 0.5           # 梯度裁剪
 

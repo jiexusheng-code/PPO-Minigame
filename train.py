@@ -64,7 +64,8 @@ def main():
         handlers=[
             logging.FileHandler(log_file, encoding='utf-8'),
             logging.StreamHandler()
-        ]
+        ],
+        force=True
     )
     logger = logging.getLogger("train")
     logger.info("==== RL训练启动 ====")
@@ -95,14 +96,36 @@ def main():
     # 使用EvalCallback只保存表现最好的模型
     eval_env = make_vec_env(env_fn, n_envs=1, seed=seed+100, wrapper_class=Monitor)
     best_model_save_path = out_dir if save_best_model else None
-    eval_callback = EvalCallback(
+    class LogEvalCallback(EvalCallback):
+        def __init__(self, *args, logger=None, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._logger = logger or logging.getLogger("train")
+
+        def _on_step(self) -> bool:
+            do_eval = self.eval_freq > 0 and self.n_calls % self.eval_freq == 0
+            if do_eval:
+                self._logger.info(
+                    f"[EvalCallback] 触发评估: num_timesteps={self.num_timesteps}, n_calls={self.n_calls}, eval_freq={self.eval_freq}"
+                )
+            result = super()._on_step()
+            if do_eval:
+                self._logger.info(
+                    f"[EvalCallback] 评估完成: num_timesteps={self.num_timesteps}, last_mean_reward={self.last_mean_reward}, last_mean_ep_length={self.last_mean_ep_length}"
+                )
+            return result
+
+    eval_callback = LogEvalCallback(
         eval_env,
         best_model_save_path=best_model_save_path,
         log_path=out_dir,
         eval_freq=eval_freq,
         deterministic=eval_deterministic,
         render=eval_render,
-        n_eval_episodes=n_eval_episodes
+        n_eval_episodes=n_eval_episodes,
+        logger=logger
+    )
+    logger.info(
+        f"[EvalCallback] 有效评估频率: eval_freq={eval_callback.eval_freq} (n_envs={vec_env.num_envs})"
     )
     logger.info(f"开始训练，总步数: {total_timesteps}")
     logger.info(f"评估频率(eval_freq): {eval_freq}, 每次评估episode数: {n_eval_episodes}, 保存最佳模型: {save_best_model}")
