@@ -21,7 +21,7 @@ n_epochs: 10                 # 每轮更新的epoch数
 gamma: 0.99                  # 折扣因子
 gae_lambda: 0.95             # GAE参数
 n_steps: 2048                # 每个环境采样步数，建议512~4096
-clip_range: 0.15             # PPO裁剪范围
+clip_range: 0.2             # PPO裁剪范围
 vf_coef: 0.5                 # value loss系数
 max_grad_norm: 0.5           # 梯度裁剪
 
