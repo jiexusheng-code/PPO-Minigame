@@ -3,6 +3,7 @@
 import os
 import yaml
 import logging
+import numpy as np
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import EvalCallback
 from stable_baselines3.common.env_util import make_vec_env
@@ -96,11 +97,52 @@ def main():
     eval_env = make_vec_env(env_fn, n_envs=1, seed=seed+100, wrapper_class=Monitor)
     best_model_save_path = out_dir if save_best_model else None
     class LogEvalCallback(EvalCallback):
-        def __init__(self, *args, logger=None, **kwargs):
+        def __init__(self, *args, logger=None, log_native_reward=False, **kwargs):
             super().__init__(*args, **kwargs)
             self._logger = logger or logging.getLogger("train")
+            self._log_native_reward = log_native_reward
+
+        def _log_rollout_native_reward(self):
+            infos = self.locals.get("infos") if isinstance(self.locals, dict) else None
+            if not infos:
+                return
+            native_vals = []
+            for info in infos:
+                if isinstance(info, dict) and "native_reward" in info:
+                    native_vals.append(float(info.get("native_reward", 0.0)))
+            if native_vals:
+                self.logger.record("rollout/native_reward", float(np.mean(native_vals)))
+
+        def _evaluate_policy(self, model, eval_env, n_eval_episodes, deterministic, render):
+            ep_rewards = []
+            ep_native_rewards = []
+
+            for _ in range(n_eval_episodes):
+                obs = eval_env.reset()
+                done = False
+                ep_reward = 0.0
+                ep_native = 0.0
+                while not done:
+                    action, _ = model.predict(obs, deterministic=deterministic)
+                    obs, rewards, dones, infos = eval_env.step(action)
+                    reward = float(rewards[0]) if isinstance(rewards, (list, tuple, np.ndarray)) else float(rewards)
+                    info = infos[0] if isinstance(infos, (list, tuple)) and len(infos) > 0 else {}
+                    done = bool(dones[0]) if isinstance(dones, (list, tuple, np.ndarray)) else bool(dones)
+                    ep_reward += reward
+                    if isinstance(info, dict):
+                        ep_native += float(info.get("native_reward", 0.0))
+                ep_rewards.append(ep_reward)
+                ep_native_rewards.append(ep_native)
+
+            mean_reward = float(np.mean(ep_rewards)) if ep_rewards else 0.0
+            std_reward = float(np.std(ep_rewards)) if ep_rewards else 0.0
+            if self._log_native_reward and ep_native_rewards:
+                self.logger.record("eval/native_reward", float(np.mean(ep_native_rewards)))
+            return mean_reward, std_reward
 
         def _on_step(self) -> bool:
+            if self._log_native_reward:
+                self._log_rollout_native_reward()
             do_eval = self.eval_freq > 0 and self.n_calls % self.eval_freq == 0
             if do_eval:
                 self._logger.info(
@@ -113,6 +155,7 @@ def main():
                 )
             return result
 
+    reward_mode = env_kwargs.get("reward_mode", "native")
     eval_callback = LogEvalCallback(
         eval_env,
         best_model_save_path=best_model_save_path,
@@ -121,7 +164,8 @@ def main():
         deterministic=eval_deterministic,
         render=eval_render,
         n_eval_episodes=n_eval_episodes,
-        logger=logger
+        logger=logger,
+        log_native_reward=(reward_mode == "custom")
     )
     logger.info(
         f"[EvalCallback] 有效评估频率: eval_freq={eval_callback.eval_freq} (n_envs={vec_env.num_envs})"

@@ -20,6 +20,7 @@ class PySC2GymEnv(gym.Env):
         minimap_size: int = 32,
         step_mul: int = 8,
         visualize: bool = False,
+        reward_mode: str = "native",
     ):
         import logging, os, datetime
         super().__init__()
@@ -28,6 +29,7 @@ class PySC2GymEnv(gym.Env):
         self.minimap_size = minimap_size 
         self.step_mul = step_mul
         self.visualize = visualize
+        self.reward_mode = reward_mode
         self._step_count = 0  # 记录步数
 
         # 日志设置：只用主进程的logging.basicConfig，所有模块共用同一日志文件
@@ -55,6 +57,8 @@ class PySC2GymEnv(gym.Env):
         self.action_space = None
         self._max_args = 0
         self.timestep = None  # 维护当前timestep
+        self._reward_state = None
+        self._reward_fn = None
         self._lazy_init()
         self._build_action_space()
         initial_ts = self._env.reset()
@@ -62,6 +66,16 @@ class PySC2GymEnv(gym.Env):
         parsed = self._parser.parse(self.timestep.observation)
         parsed_flat = self._flatten_parsed(parsed)
         self._build_observation_space_from_parser(parsed_flat)
+
+        # Reward selection (native/custom)
+        if self.reward_mode not in ["native", "custom"]:
+            raise ValueError("reward_mode must be 'native' or 'custom'")
+        if self.reward_mode == "custom":
+            from src.reward_registry import get_reward_fn, RewardState
+            self._reward_fn = get_reward_fn(self.map_name)
+            if self._reward_fn is None:
+                raise ValueError(f"No custom reward registered for map: {self.map_name}")
+            self._reward_state = RewardState()
 
     def _build_action_space(self):
         try:
@@ -190,6 +204,11 @@ class PySC2GymEnv(gym.Env):
         self.timestep = timesteps[0]
         obs_dict = self._obs_to_space(self.timestep)
         info = {}
+        if self.reward_mode == "custom" and self._reward_fn is not None:
+            # Reset reward state and compute initial distance baseline
+            from src.reward_registry import RewardState
+            self._reward_state = RewardState()
+            _ = self._reward_fn(obs_dict, self._reward_state, info)
         return obs_dict, info
 
     def _unwrap_action(self, action):
@@ -276,10 +295,15 @@ class PySC2GymEnv(gym.Env):
         self._step_count += 1
 
         obs = self._obs_to_space(self.timestep)
-        reward = float(self.timestep.reward)
+        native_reward = float(self.timestep.reward)
+        reward = native_reward
         terminated = bool(self.timestep.last())
         truncated = False
-        info = {"arg_clipped": clipped, "fn_available": fn_id in available}
+        info = {"arg_clipped": clipped, "fn_available": fn_id in available, "native_reward": native_reward}
+
+        if self.reward_mode == "custom" and self._reward_fn is not None:
+            reward = float(self._reward_fn(obs, self._reward_state, info))
+            info["custom_reward"] = reward
         
         self.logger.debug(f"Step {self._step_count}")
         self.logger.debug(f"  Agent raw action: fn_id={fn_id}, raw_params={raw_params}")
