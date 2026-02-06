@@ -6,17 +6,17 @@ channels:
 dependencies:
   - python=3.10
   - pip
-  - "numpy<2.0"
-  - scipy
-  - scikit-video
+  - numpy=1.26.4
+  - scipy=1.11.4
+  - scikit-video=1.1.11
+  - opencv=4.8.1
   - cpuonly
   - pytorch=2.2
   - pip:
     - stable-baselines3==2.3.0
     - pysc2==3.0.0
     - gymnasium==0.29.1
-    - tensorboard
-    - opencv-python==4.8.1.78
-    - absl-py>=1.0.0
-    - "protobuf>=3.20,<4.0"
-    - pyyaml>=6.0
+    - tensorboard==2.19.0
+    - absl-py==1.4.0
+    - protobuf==3.20.3
+    - pyyaml==6.0.1
