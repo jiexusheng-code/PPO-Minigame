@@ -3,6 +3,8 @@
 import os
 import yaml
 import logging
+from collections import deque
+
 import numpy as np
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import EvalCallback
@@ -101,17 +103,39 @@ def main():
             super().__init__(*args, **kwargs)
             self._logger = logger or logging.getLogger("train")
             self._log_native_reward = log_native_reward
+            self._native_running_rewards = None
+            self._native_ep_reward_buffer = None
 
-        def _log_rollout_native_reward(self):
-            infos = self.locals.get("infos") if isinstance(self.locals, dict) else None
-            if not infos:
+        def _init_native_rollout_buffers(self) -> None:
+            if self.training_env is None:
                 return
-            native_vals = []
-            for info in infos:
-                if isinstance(info, dict) and "native_reward" in info:
-                    native_vals.append(float(info.get("native_reward", 0.0)))
-            if native_vals:
-                self.logger.record("rollout/native_reward", float(np.mean(native_vals)))
+            n_envs = self.training_env.num_envs
+            self._native_running_rewards = [0.0 for _ in range(n_envs)]
+            maxlen = 100
+            if hasattr(self.model, "ep_info_buffer") and self.model.ep_info_buffer is not None:
+                try:
+                    maxlen = self.model.ep_info_buffer.maxlen
+                except Exception:
+                    maxlen = 100
+            self._native_ep_reward_buffer = deque(maxlen=maxlen)
+
+        def _log_rollout_native_ep_reward(self) -> None:
+            if self._native_running_rewards is None or self._native_ep_reward_buffer is None:
+                self._init_native_rollout_buffers()
+            infos = self.locals.get("infos") if isinstance(self.locals, dict) else None
+            dones = self.locals.get("dones") if isinstance(self.locals, dict) else None
+            if not infos or dones is None:
+                return
+            for idx, (info, done) in enumerate(zip(infos, dones)):
+                if not isinstance(info, dict):
+                    continue
+                self._native_running_rewards[idx] += float(info.get("native_reward", 0.0))
+                if bool(done):
+                    self._native_ep_reward_buffer.append(self._native_running_rewards[idx])
+                    self._native_running_rewards[idx] = 0.0
+            if len(self._native_ep_reward_buffer) > 0:
+                mean_native_ep_reward = float(np.mean(self._native_ep_reward_buffer))
+                self.logger.record("rollout/ep_native_rew_mean", mean_native_ep_reward)
 
         def _evaluate_policy(self, model, eval_env, n_eval_episodes, deterministic, render):
             ep_rewards = []
@@ -137,12 +161,12 @@ def main():
             mean_reward = float(np.mean(ep_rewards)) if ep_rewards else 0.0
             std_reward = float(np.std(ep_rewards)) if ep_rewards else 0.0
             if self._log_native_reward and ep_native_rewards:
-                self.logger.record("eval/native_reward", float(np.mean(ep_native_rewards)))
+                self.logger.record("eval/mean_native_reward", float(np.mean(ep_native_rewards)))
             return mean_reward, std_reward
 
         def _on_step(self) -> bool:
             if self._log_native_reward:
-                self._log_rollout_native_reward()
+                self._log_rollout_native_ep_reward()
             do_eval = self.eval_freq > 0 and self.n_calls % self.eval_freq == 0
             if do_eval:
                 self._logger.info(
@@ -154,6 +178,11 @@ def main():
                     f"[EvalCallback] 评估完成: num_timesteps={self.num_timesteps}, last_mean_reward={self.last_mean_reward}"
                 )
             return result
+
+        def _on_training_start(self) -> None:
+            super()._on_training_start()
+            if self._log_native_reward:
+                self._init_native_rollout_buffers()
 
     reward_mode = env_kwargs.get("reward_mode", "native")
     eval_callback = LogEvalCallback(
