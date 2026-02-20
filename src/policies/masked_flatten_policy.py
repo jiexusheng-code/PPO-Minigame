@@ -1,9 +1,11 @@
 """MultiInput policy with action masking on function id and flatten coordinate heads via MultiDiscrete action space."""
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from pysc2.lib import features
+from pysc2.lib import actions as pysc2_actions
 from stable_baselines3.common.distributions import MultiCategoricalDistribution
 from stable_baselines3.common.preprocessing import get_flattened_obs_dim
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
@@ -230,6 +232,102 @@ class MaskedFlattenPolicy(MultiInputPolicy):
         mask = mask.to(action_logits.device)
         func_logits = func_logits + (mask <= 0).float() * (-1e9)
         return torch.cat([func_logits, rest_logits], dim=1)
+
+    def _build_slot_map_if_needed(self, device=None):
+        # Build param semantics and fn->slot mapping consistent with PySC2GymEnv
+        if getattr(self, "_slot_map_built", False):
+            return
+        param_semantics = []
+        param_semantics_set = set()
+        for fn in pysc2_actions.FUNCTIONS:
+            for spec in fn.args:
+                name = getattr(spec, "name")
+                if name not in param_semantics_set:
+                    param_semantics.append(name)
+                    param_semantics_set.add(name)
+
+        # fn_id -> list of slot indices (in param_semantics order)
+        fn_param_map = {}
+        for fn in pysc2_actions.FUNCTIONS:
+            slot_indices = []
+            for spec in fn.args:
+                name = getattr(spec, "name")
+                slot_indices.append(param_semantics.index(name))
+            fn_param_map[fn.id] = slot_indices
+
+        # slot sizes come from action_space.nvec (skip first entry which is fn head)
+        nvec = list(self.action_space.nvec)
+        slot_sizes = nvec[1:]
+
+        # build fn -> binary mask over slots tensor for fast indexing
+        n_funcs = int(nvec[0])
+        n_slots = len(slot_sizes)
+        fn_slot_mask = torch.zeros((n_funcs, n_slots), dtype=torch.float32)
+        for fid, slots in fn_param_map.items():
+            for s in slots:
+                if s < n_slots:
+                    fn_slot_mask[fid, s] = 1.0
+
+        self._param_semantics = param_semantics
+        self._fn_param_map = fn_param_map
+        self._slot_sizes = slot_sizes
+        self._fn_slot_mask = fn_slot_mask.to(device) if device is not None else fn_slot_mask
+        self._slot_map_built = True
+
+    def _joint_logprob_and_entropy(self, logits: torch.Tensor, actions: torch.Tensor):
+        """Compute joint log_prob and entropy while ignoring unused arg slots per-sample.
+
+        logits: (B, sum(nvec))
+        actions: (B, n_actions)  # first col is fn_id, following are slot values (can be -1)
+        Returns: log_prob (B,), entropy (B,)
+        """
+        device = logits.device
+        self._build_slot_map_if_needed(device=device)
+        nvec = list(self.action_space.nvec)
+        # split logits per head
+        sizes = [int(x) for x in nvec]
+        splits = torch.split(logits, sizes, dim=1)
+        fn_logits = splits[0]
+        slot_logits = splits[1:]
+
+        batch_size = logits.shape[0]
+
+        # function log_prob
+        fn_logp = F.log_softmax(fn_logits, dim=1)
+        fn_ids = actions[:, 0].long()
+        fn_selected = fn_logp.gather(1, fn_ids.clamp(min=0, max=fn_logits.shape[1]-1).unsqueeze(1)).squeeze(1)
+
+        # per-slot log probs and entropy
+        slot_logps = []
+        slot_ents = []
+        # actions for slots are in actions[:, 1:]
+        slot_actions = actions[:, 1:]
+
+        for i, s_logits in enumerate(slot_logits):
+            # s_logits: (B, size)
+            size = s_logits.shape[1]
+            probs = F.softmax(s_logits, dim=1)
+            logp = F.log_softmax(s_logits, dim=1)
+            # gather selected indices, clamp to valid range
+            a_i = slot_actions[:, i].long()
+            gather_idx = a_i.clamp(min=0, max=size-1).unsqueeze(1)
+            picked = logp.gather(1, gather_idx).squeeze(1)
+            # used mask from fn mapping
+            # fn_slot_mask: (n_funcs, n_slots)
+            fn_mask = self._fn_slot_mask[fn_ids]  # (B, n_slots)
+            used = fn_mask[:, i]
+            picked = picked * used
+            slot_logps.append(picked)
+
+            ent = - (probs * logp).sum(dim=1)
+            ent = ent * used
+            slot_ents.append(ent)
+
+        total_logp = fn_selected + sum(slot_logps) if len(slot_logps) > 0 else fn_selected
+        total_ent = (- (F.softmax(fn_logits, dim=1) * F.log_softmax(fn_logits, dim=1))).sum(dim=1)
+        if len(slot_ents) > 0:
+            total_ent = total_ent + sum(slot_ents)
+        return total_logp, total_ent
 
     def _get_masked_distribution(self, obs):
         features = self.extract_features(obs)

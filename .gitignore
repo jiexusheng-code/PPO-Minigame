@@ -64,3 +64,4 @@ credentials/
 # *.zip
 pysc2/
 s2client-proto/
+pysc2-rl-agents/
