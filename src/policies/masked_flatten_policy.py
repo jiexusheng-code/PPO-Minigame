@@ -231,6 +231,14 @@ class MaskedFlattenPolicy(MultiInputPolicy):
         func_logits = func_logits + (mask <= 0).float() * (-1e9)
         return torch.cat([func_logits, rest_logits], dim=1)
 
+    def _get_masked_distribution(self, obs):
+        features = self.extract_features(obs)
+        latent_pi, _ = self.mlp_extractor(features)
+        logits = self.action_net(latent_pi)
+        if isinstance(self.action_dist, MultiCategoricalDistribution) and "available_actions" in obs:
+            logits = self._apply_action_mask(logits, obs["available_actions"])
+        return self.action_dist.proba_distribution(logits)
+
     def forward(self, obs, deterministic: bool = False):
         # 1. 特征提取
         features = self.extract_features(obs)
@@ -250,9 +258,19 @@ class MaskedFlattenPolicy(MultiInputPolicy):
         return actions, values, log_prob
 
     def get_distribution(self, obs):
+        return self._get_masked_distribution(obs)
+
+    def evaluate_actions(self, obs, actions):
+        """Ensure train-time log_prob/entropy use the same mask as sampling-time."""
         features = self.extract_features(obs)
-        latent_pi, _ = self.mlp_extractor(features)
+        latent_pi, latent_vf = self.mlp_extractor(features)
+        values = self.value_net(latent_vf)
+
         logits = self.action_net(latent_pi)
         if isinstance(self.action_dist, MultiCategoricalDistribution) and "available_actions" in obs:
             logits = self._apply_action_mask(logits, obs["available_actions"])
-        return self.action_dist.proba_distribution(logits)
+
+        distribution = self.action_dist.proba_distribution(logits)
+        log_prob = distribution.log_prob(actions)
+        entropy = distribution.entropy()
+        return values, log_prob, entropy
