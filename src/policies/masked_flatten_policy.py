@@ -329,13 +329,76 @@ class MaskedFlattenPolicy(MultiInputPolicy):
             total_ent = total_ent + sum(slot_ents)
         return total_logp, total_ent
 
+    def _joint_entropy_from_logits(self, logits: torch.Tensor):
+        """Compute per-sample entropy of the joint action distribution given logits.
+
+        Uses expected slot usage under fn distribution: E[entropy] = H(fn) + sum_i E[used_i] * H(arg_i)
+        """
+        device = logits.device
+        self._build_slot_map_if_needed(device=device)
+        nvec = list(self.action_space.nvec)
+        sizes = [int(x) for x in nvec]
+        splits = torch.split(logits, sizes, dim=1)
+        fn_logits = splits[0]
+        slot_logits = splits[1:]
+
+        fn_probs = F.softmax(fn_logits, dim=1)
+        fn_entropy = - (fn_probs * F.log_softmax(fn_logits, dim=1)).sum(dim=1)
+
+        # compute each slot entropy (B,)
+        slot_entropies = []
+        for s_logits in slot_logits:
+            ent = - (F.softmax(s_logits, dim=1) * F.log_softmax(s_logits, dim=1)).sum(dim=1)
+            slot_entropies.append(ent)
+
+        if len(slot_entropies) == 0:
+            return fn_entropy
+
+        # expected usage per slot: (B, n_slots) = fn_probs (B, n_funcs) @ fn_slot_mask (n_funcs, n_slots)
+        expected_usage = fn_probs.matmul(self._fn_slot_mask.to(device))
+
+        # combine: total_ent = fn_entropy + sum_i expected_usage[:,i] * slot_entropies[i]
+        total = fn_entropy
+        for i, ent in enumerate(slot_entropies):
+            total = total + expected_usage[:, i] * ent
+        return total
+
     def _get_masked_distribution(self, obs):
         features = self.extract_features(obs)
         latent_pi, _ = self.mlp_extractor(features)
         logits = self.action_net(latent_pi)
         if isinstance(self.action_dist, MultiCategoricalDistribution) and "available_actions" in obs:
             logits = self._apply_action_mask(logits, obs["available_actions"])
-        return self.action_dist.proba_distribution(logits)
+        base_dist = self.action_dist.proba_distribution(logits)
+
+        # Wrapper to override log_prob and entropy using joint per-slot masking
+        policy_ref = self
+
+        class JointMaskedDistribution:
+            def __init__(self, base, logits, policy):
+                self.base = base
+                self.logits = logits
+                self.policy = policy
+
+            def get_actions(self, deterministic: bool = False):
+                return self.base.get_actions(deterministic=deterministic)
+
+            def log_prob(self, actions):
+                # actions may be numpy or tensor
+                if not isinstance(actions, torch.Tensor):
+                    try:
+                        actions_t = torch.as_tensor(actions, device=self.logits.device)
+                    except Exception:
+                        actions_t = torch.tensor(actions, device=self.logits.device)
+                else:
+                    actions_t = actions.to(self.logits.device)
+                logp, _ = self.policy._joint_logprob_and_entropy(self.logits, actions_t)
+                return logp
+
+            def entropy(self):
+                return self.policy._joint_entropy_from_logits(self.logits)
+
+        return JointMaskedDistribution(base_dist, logits, policy_ref)
 
     def forward(self, obs, deterministic: bool = False):
         # 1. 特征提取
