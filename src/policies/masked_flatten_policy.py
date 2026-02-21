@@ -352,7 +352,16 @@ class MaskedFlattenPolicy(MultiInputPolicy):
         distribution = self.action_dist.proba_distribution(logits)
         actions = distribution.get_actions(deterministic=deterministic)
 
-        log_prob = distribution.log_prob(actions)
+        # ensure actions is a tensor on the same device
+        if not isinstance(actions, torch.Tensor):
+            try:
+                actions_t = torch.as_tensor(actions, device=logits.device)
+            except Exception:
+                actions_t = torch.tensor(actions, device=logits.device)
+        else:
+            actions_t = actions.to(logits.device)
+
+        log_prob, _ = self._joint_logprob_and_entropy(logits, actions_t)
         return actions, values, log_prob
 
     def get_distribution(self, obs):
@@ -368,7 +377,14 @@ class MaskedFlattenPolicy(MultiInputPolicy):
         if isinstance(self.action_dist, MultiCategoricalDistribution) and "available_actions" in obs:
             logits = self._apply_action_mask(logits, obs["available_actions"])
 
-        distribution = self.action_dist.proba_distribution(logits)
-        log_prob = distribution.log_prob(actions)
-        entropy = distribution.entropy()
+        # compute joint log_prob and entropy using sample-level mask
+        if not isinstance(actions, torch.Tensor):
+            try:
+                actions_t = torch.as_tensor(actions, device=logits.device)
+            except Exception:
+                actions_t = torch.tensor(actions, device=logits.device)
+        else:
+            actions_t = actions.to(logits.device)
+
+        log_prob, entropy = self._joint_logprob_and_entropy(logits, actions_t)
         return values, log_prob, entropy
