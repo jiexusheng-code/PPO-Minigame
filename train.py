@@ -10,7 +10,7 @@ from stable_baselines3.common.monitor import Monitor
 from src.policies.masked_flatten_policy import MaskedFlattenPolicy, VectorLayerNormExtractor
 from src.callbacks.tb_dual_writer import TBDualWriterCallback
 
-DEFAULT_CONFIG_PATH = "./configs/ppo_config.yaml"
+DEFAULT_CONFIG_PATH = os.environ.get("TRAIN_CONFIG_PATH", "./configs/ppo_config.yaml")
 
 def make_env_fn(map_name: str, env_kwargs=None):
     from src.envs.pysc2_gym_wrapper import PySC2GymEnv

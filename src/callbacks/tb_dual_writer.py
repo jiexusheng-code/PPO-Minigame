@@ -31,6 +31,10 @@ class TBDualWriterCallback(BaseCallback):
         self.env_writer = SummaryWriter(env_dir)
         self.opt_writer = SummaryWriter(opt_dir)
 
+    def _on_step(self) -> bool:
+        # Required by BaseCallback; no per-step action needed for this writer
+        return True
+
     def _is_main_process(self) -> bool:
         """Try to detect main process using common environment variables. Defaults to True."""
         try:

@@ -1,0 +1,34 @@
+env: MoveToBeacon
+out_dir: ./models
+checkpoint_path: 
+n_envs: 1
+seed: 0
+policy: MaskedFlattenPolicy
+policy_kwargs:
+  features_extractor_kwargs:
+    cnn_output_dim: 256
+env_kwargs:
+  screen_size: 32
+  minimap_size: 32
+  step_mul: 8
+  visualize: false
+total_timesteps: 512
+learning_rate: 1.5e-4
+ent_coef: 0.02
+batch_size: 64
+n_epochs: 1
+gamma: 0.99
+gae_lambda: 0.95
+n_steps: 64
+clip_range: 0.15
+vf_coef: 0.5
+max_grad_norm: 0.5
+eval_freq: 1000000
+n_eval_episodes: 1
+eval_deterministic: false
+eval_render: false
+tensorboard: true
+tb_log_dir: tb_logs
+log_interval: 1
+save_best_model: false
+verbose: 1

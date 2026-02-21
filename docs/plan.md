@@ -49,3 +49,9 @@
   - 控制写入频率（例如每次 update 或每 K 次 update 写一次），避免过多小文件；仅由主进程写 TensorBoard 日志。
 
     - 已实现：`TBDualWriterCallback` 增加 `write_env_every` 与 `write_opt_every` 参数，且在写入前检查常见分布式环境变量（`RANK`/`OMPI_COMM_WORLD_RANK`/`LOCAL_RANK`/`SLURM_PROCID`），仅在主进程写入。默认频率为 1（每次写入）。
+
+## 验证
+
+- [x] smoke test
+
+  - 说明：已运行短时 smoke test（`total_timesteps=512`）。结果：`models/<ts>/tb_logs/env-step` 含 SB3 写入的事件文件，`models/<ts>/tb_logs/optimization-step` 含 callback 写入的事件文件，显示 per-arg 指标已被写入。
