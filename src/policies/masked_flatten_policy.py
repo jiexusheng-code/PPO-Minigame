@@ -327,6 +327,42 @@ class MaskedFlattenPolicy(MultiInputPolicy):
         total_ent = (- (F.softmax(fn_logits, dim=1) * F.log_softmax(fn_logits, dim=1))).sum(dim=1)
         if len(slot_ents) > 0:
             total_ent = total_ent + sum(slot_ents)
+
+        # Cache per-arg statistics for external callbacks/monitoring
+        try:
+            # fn entropy mean
+            fn_probs = F.softmax(fn_logits, dim=1)
+            fn_entropy_per_sample = - (fn_probs * F.log_softmax(fn_logits, dim=1)).sum(dim=1)
+            fn_entropy_mean = float(fn_entropy_per_sample.mean().detach().cpu().item())
+
+            slot_used_means = []
+            slot_entropy_means = []
+            # slot_ents contains ent * used already; need used statistics per slot
+            for i, s_logits in enumerate(slot_logits):
+                size = s_logits.shape[1]
+                # raw entropy per-sample for this slot
+                raw_ent = - (F.softmax(s_logits, dim=1) * F.log_softmax(s_logits, dim=1)).sum(dim=1)
+                # used mask for this slot across batch
+                fn_mask = self._fn_slot_mask[fn_ids]  # (B, n_slots)
+                used = fn_mask[:, i]
+                used_sum = float(used.sum().detach().cpu().item())
+                used_mean = float(used.mean().detach().cpu().item()) if used.numel() > 0 else 0.0
+                if used_sum > 0:
+                    ent_mean = float((raw_ent * used).sum().detach().cpu().item() / (used_sum + 1e-8))
+                else:
+                    ent_mean = 0.0
+                slot_used_means.append(used_mean)
+                slot_entropy_means.append(ent_mean)
+
+            self._last_per_arg_stats = {
+                "fn_entropy_mean": fn_entropy_mean,
+                "slot_used_mean": slot_used_means,
+                "slot_entropy_mean": slot_entropy_means,
+            }
+        except Exception:
+            # non-critical: do not break training if stats computation fails
+            self._last_per_arg_stats = None
+
         return total_logp, total_ent
 
     def _joint_entropy_from_logits(self, logits: torch.Tensor):

@@ -4,10 +4,11 @@ import os
 import yaml
 import logging
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import EvalCallback
+from stable_baselines3.common.callbacks import EvalCallback, CallbackList
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.monitor import Monitor
 from src.policies.masked_flatten_policy import MaskedFlattenPolicy, VectorLayerNormExtractor
+from src.callbacks.tb_dual_writer import TBDualWriterCallback
 
 DEFAULT_CONFIG_PATH = "./configs/ppo_config.yaml"
 
@@ -87,11 +88,13 @@ def main():
         logger.warning(f"无法检测PyTorch设备: {e}")
     device = "auto"
     checkpoint_path = cfg.get("checkpoint_path", None)
+    # Ensure SB3 writes its default scalars into the env-step subdirectory
+    tb_log_for_sb3 = os.path.join(tb_log, "env-step") if tb_log is not None else None
     if checkpoint_path and os.path.isfile(checkpoint_path):
         logger.info(f"[INFO] 从checkpoint加载模型: {checkpoint_path}")
-        model = PPO.load(checkpoint_path, env=vec_env, tensorboard_log=tb_log, policy=policy, policy_kwargs=policy_kwargs, device=device, **ppo_kwargs)
+        model = PPO.load(checkpoint_path, env=vec_env, tensorboard_log=tb_log_for_sb3, policy=policy, policy_kwargs=policy_kwargs, device=device, **ppo_kwargs)
     else:
-        model = PPO(policy, vec_env, verbose=verbose_level, tensorboard_log=tb_log, policy_kwargs=policy_kwargs, device=device, **ppo_kwargs)
+        model = PPO(policy, vec_env, verbose=verbose_level, tensorboard_log=tb_log_for_sb3, policy_kwargs=policy_kwargs, device=device, **ppo_kwargs)
     # 使用EvalCallback只保存表现最好的模型
     eval_env = make_vec_env(env_fn, n_envs=1, seed=seed+100, wrapper_class=Monitor)
     best_model_save_path = out_dir if save_best_model else None
@@ -132,7 +135,14 @@ def main():
     # 日志/打印间隔（多少次学习更新写一次日志）
     log_interval = cfg.get("log_interval", 1)
     logger.info(f"日志间隔(log_interval): {log_interval}")
-    model.learn(total_timesteps=total_timesteps, callback=eval_callback, log_interval=log_interval)
+    # attach dual-writer callback together with EvalCallback
+    callbacks = [eval_callback]
+    if tensorboard and tb_log:
+        tb_callback = TBDualWriterCallback(tb_log)
+        callbacks.append(tb_callback)
+    callback_list = CallbackList(callbacks)
+
+    model.learn(total_timesteps=total_timesteps, callback=callback_list, log_interval=log_interval)
     logger.info("训练完成，保存最终模型...")
     model.save(os.path.join(out_dir, f"final_model_{today_str}"))
     def _sanitize_for_yaml(obj):

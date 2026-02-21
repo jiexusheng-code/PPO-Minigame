@@ -33,12 +33,17 @@
 
     - 定义并维护 `opt_step` 计数器（将其与对照项目的 global_step 等价，建议在每次完整的 PPO 更新后自增一次）。
   - 在每次优化结束时把细粒度指标（按参数类型的 entropy、per-arg used-rate、old/new logprob 统计、被剪切/非法动作比例、mini-batch 平均 loss 等）写入 `optimization-step`，x 轴使用 `opt_step` 或 episode 编号。
-  - [ ] **策略/分布层导出指标**
+  - [x] **策略/分布层导出指标**
   
   - 在 `MaskedFlattenPolicy` 中暴露 / 缓存 per-arg 统计（entropy、used mask 均值、被剪切计数等），供 Callback 在写入时读取并聚合。
-  - [ ] **实现 Callback 与写入聚合**
+  - [x] **实现 Callback 与写入聚合**
 
     - 新增自定义 SB3 Callback：在 `on_rollout_end` 聚合本轮的训练标量并写入 `env-step`（global_step=num_timesteps）和 `optimization-step`（global_step=opt_step）。对 per-arg 指标做 batch 平均后写入，减少 I/O。
+
+    - 已实现：
+
+      - 在 `MaskedFlattenPolicy` 中缓存 `self._last_per_arg_stats`（fn_entropy_mean / slot_used_mean / slot_entropy_mean）。
+      - 新增 `src/callbacks/tb_dual_writer.py` 实现双目录写入，并已在 `train.py` 中接入 CallbackList。
 - [ ] **性能与稳定性调优**
   
   - 控制写入频率（例如每次 update 或每 K 次 update 写一次），避免过多小文件；仅由主进程写 TensorBoard 日志。
