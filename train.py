@@ -81,12 +81,14 @@ def main():
         import torch
         if torch.cuda.is_available():
             device_str = f"cuda:{torch.cuda.current_device()} ({torch.cuda.get_device_name(torch.cuda.current_device())})"
+            device = "cuda"
         else:
             device_str = "cpu"
+            device = "cpu"
         logger.info(f"PyTorch 当前设备: {device_str}")
     except Exception as e:
         logger.warning(f"无法检测PyTorch设备: {e}")
-    device = "auto"
+        device = "cpu"
     checkpoint_path = cfg.get("checkpoint_path", None)
     # Ensure SB3 writes its default scalars into the env-step subdirectory
     tb_log_for_sb3 = os.path.join(tb_log, "env-step") if tb_log is not None else None
