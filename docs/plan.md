@@ -44,6 +44,8 @@
 
       - 在 `MaskedFlattenPolicy` 中缓存 `self._last_per_arg_stats`（fn_entropy_mean / slot_used_mean / slot_entropy_mean）。
       - 新增 `src/callbacks/tb_dual_writer.py` 实现双目录写入，并已在 `train.py` 中接入 CallbackList。
-- [ ] **性能与稳定性调优**
-  
+  - [x] **性能与稳定性调优**
+
   - 控制写入频率（例如每次 update 或每 K 次 update 写一次），避免过多小文件；仅由主进程写 TensorBoard 日志。
+
+    - 已实现：`TBDualWriterCallback` 增加 `write_env_every` 与 `write_opt_every` 参数，且在写入前检查常见分布式环境变量（`RANK`/`OMPI_COMM_WORLD_RANK`/`LOCAL_RANK`/`SLURM_PROCID`），仅在主进程写入。默认频率为 1（每次写入）。
