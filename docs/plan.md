@@ -21,18 +21,18 @@
 
   - [x] **接入 SB3 策略兼容层**
 
-- [ ] 分离 env-step / optimization-step 写入
+- [ ] 分离两个 TensorBoard 子目录写入语义
 
   - [ ] **新增两个 TensorBoard 子目录**
 
-    - 在输出目录下创建 `tb_logs/env-step`（以环境交互步为 x 轴）和 `tb_logs/optimization-step`（以优化步或 episode 为 x 轴）。
+    - 在输出目录下创建 `tb_logs/fundamental`（以 optimization-step 为 x 轴）和 `tb_logs/extra`（以 optimization-step 为 x 轴）。
 - [ ] **实现 env-step 写入逻辑**
   
   - 使用 SB3 的 `num_timesteps` 或 `model.num_timesteps` 作为 `env-step` 的 global_step，写入训练中按时间自然产生的标量（policy loss、value loss、总体 entropy、lr、eval mean reward 等）。
   - [ ] **实现 optimization-step 写入逻辑**
 
     - 定义并维护 `opt_step` 计数器（将其与对照项目的 global_step 等价，建议在每次完整的 PPO 更新后自增一次）。
-  - 在每次优化结束时把细粒度指标（按参数类型的 entropy、per-arg used-rate、old/new logprob 统计、被剪切/非法动作比例、mini-batch 平均 loss 等）写入 `optimization-step`，x 轴使用 `opt_step` 或 episode 编号。
+  - 在每次优化结束时把细粒度指标（按参数类型的 entropy、per-arg used-rate、old/new logprob 统计、被剪切/非法动作比例、mini-batch 平均 loss 等）写入 `extra`（或 `fundamental` 中的额外分组），x 轴统一使用 `opt_step`（optimization-step）。
   - [x] **策略/分布层导出指标**
   
   - 在 `MaskedFlattenPolicy` 中暴露 / 缓存 per-arg 统计（entropy、used mask 均值、被剪切计数等），供 Callback 在写入时读取并聚合。
@@ -40,10 +40,10 @@
 
     - 新增自定义 SB3 Callback：在 `on_rollout_end` 聚合本轮的训练标量并写入 `env-step`（global_step=num_timesteps）和 `optimization-step`（global_step=opt_step）。对 per-arg 指标做 batch 平均后写入，减少 I/O。
 
-    - 已实现：
+      - 已实现：
 
-      - 在 `MaskedFlattenPolicy` 中缓存 `self._last_per_arg_stats`（fn_entropy_mean / slot_used_mean / slot_entropy_mean）。
-      - 新增 `src/callbacks/tb_dual_writer.py` 实现双目录写入，并已在 `train.py` 中接入 CallbackList。
+        - 在 `MaskedFlattenPolicy` 中缓存 `self._last_per_arg_stats`（fn_entropy_mean / slot_used_mean / slot_entropy_mean）。
+        - 新增 `src/callbacks/tb_dual_writer.py` 实现写入到 `fundamental` 与 `extra` 两个子目录，并已在 `train.py` 中接入 CallbackList。
   - [x] **性能与稳定性调优**
 
   - 控制写入频率（例如每次 update 或每 K 次 update 写一次），避免过多小文件；仅由主进程写 TensorBoard 日志。
@@ -54,4 +54,8 @@
 
 - [x] smoke test
 
-  - 说明：已运行短时 smoke test（`total_timesteps=512`）。结果：`models/<ts>/tb_logs/env-step` 含 SB3 写入的事件文件，`models/<ts>/tb_logs/optimization-step` 含 callback 写入的事件文件，显示 per-arg 指标已被写入。
+  - 说明：已运行短时 smoke test（`total_timesteps=512`）。结果：`models/<ts>/tb_logs/fundamental` 含 SB3/训练主要标量写入的事件文件（x 轴统一以 optimization-step 为准），`models/<ts>/tb_logs/extra` 含 callback 写入的 per-arg/优化级别事件文件，显示 per-arg 指标已被写入。
+
+- [x] 支持持续训练直到 Ctrl+C（通过 `total_timesteps` 控制）
+
+  - 已实现：不使用独立的 `run_forever` 配置键；当 `total_timesteps` 在配置中设为 <= 0 时，训练会进入持续运行模式（循环调用 `model.learn(..., reset_num_timesteps=False)`），直到手动中断（Ctrl+C），随后自动保存模型和配置。

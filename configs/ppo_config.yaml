@@ -1,40 +1,76 @@
 env: MoveToBeacon
 out_dir: ./models
 checkpoint_path: 
-n_envs: 8                    # 并行环境的数量，也就是同时跑多少个环境实例来采样数据。值越大，采样效率通常更高，但会占用更多 CPU/GPU 和内存资源。
-seed: 0
-policy: MaskedFlattenPolicy
+
+# ----------------- 基本运行/并行设置 -----------------
+# 说明：这些参数决定采样规模与并行度，影响采样效率、GPU/CPU/内存占用和学习稳定性
+n_envs: 32                   # 并行环境数量（整数）。含义：同时并行多少个环境进行采样。
+                             # 推荐：32（pysc2-rl-agents 默认）。资源允许时可增大，但会线性增加 CPU/内存/显存开销。
+seed: 0                      # 全局随机种子（整数）。用于复现实验。
+
+# ----------------- 策略 / 模型结构 -----------------
+policy: MaskedFlattenPolicy  # 使用的策略类名（字符串或类对象）。项目内默认提供 `MaskedFlattenPolicy`。
 policy_kwargs:
   features_extractor_kwargs:
-    cnn_output_dim: 256
+    cnn_output_dim: 256      # 传给特征提取器的参数（例：CNN 输出维度）
+
+# ----------------- 环境参数 -----------------
 env_kwargs:
   screen_size: 32
   minimap_size: 32
   step_mul: 8
   visualize: false
-total_timesteps: 100000      # 总训练步数，建议10万~100万
-learning_rate: 1.5e-4        # 学习率，PPO常用
-ent_coef: 0.02               # 策略熵系数，鼓励探索
-batch_size: 512              # 每次更新的batch，建议128~1024
-n_epochs: 10                 # 每轮更新的epoch数
+
+# ----------------- 训练时长 -----------------
+# total_timesteps 的单位为 环境交互步（environment-steps）。
+# 说明：如果设为 0 或负数，表示持续训练直到手动中断（Ctrl+C）。
+total_timesteps: 100000      # 建议范围：1e5 ~ 1e7，依据问题复杂度调整
+
+# ----------------- 优化超参数（PPO） -----------------
+# 这些参数控制优化器与损失构成，推荐值参考 pysc2-rl-agents 配置
+learning_rate: 7e-4          # 学习率（float）。推荐起始值：7e-4；若训练不稳定可减小到 1e-4 ~ 3e-4
+ent_coef: 0.001              # 策略熵系数（float），鼓励探索。对应 pysc2 中 entropy_weight=1e-3
+batch_size: 128              # SB3 的 minibatch 大小（每个 epoch 使用的小批量样本数）。注：总体样本量 = n_envs * n_steps
+                             # 推荐：64-256，常用 128
+n_epochs: 4                  # 每次 rollout 收集的样本用于优化时，进行多少个 epoch（数据重复利用次数）。pysc2 默认 4
 gamma: 0.99                  # 折扣因子
-gae_lambda: 0.95             # GAE参数
-n_steps: 2048                # 每个环境采样步数，建议512~4096
-clip_range: 0.15             # PPO裁剪范围
-vf_coef: 0.5                 # value loss系数
-max_grad_norm: 0.5           # 梯度裁剪
+gae_lambda: 0.95             # GAE 的 lambda，用于优势估计
+n_steps: 16                  # 每个环境在一次 rollout 中采样的步数（整数）。1 optimization-step = n_envs * n_steps 环境步
+                             # pysc2-rl-agents 常用 n_steps=16，配合 n_envs=32 时每次 rollout 包含 512 env-steps
+clip_range: 0.2              # PPO 裁剪范围（float），限制重要性权重 ratio 的偏差，常用 0.1-0.3
+vf_coef: 0.5                 # value loss 系数
+max_grad_norm: 0.5           # 梯度裁剪阈值
+clip_value_loss: false       # 是否对 value loss 使用裁剪（bool），可以防止 value 目标瞬间剧烈变化
 
-# === 评估（Eval）设置 ===
-eval_freq: 1250             # 评估频率（timesteps），EvalCallback 会按此频率运行评估
-n_eval_episodes: 20         # 每次评估的 episode 数
-eval_deterministic: false   # 评估时是否使用确定性策略
-eval_render: false          # 评估时是否渲染（通常设置为 false）
+# ----------------- I/O / 监控 与 计数单位说明 -----------------
+# 重要：项目内所有 summary/save/eval 等频率参数统一使用 "optimization-step"（即完整的 rollout + 优化 完成后计为 1）。
+# 转换关系：1 optimization-step = n_envs * n_steps 环境步（environment-steps）。
+# 例如：n_envs=32, n_steps=16 -> 1 opt-step = 512 env-steps。若需要按环境步设置 EvalCallback，请在 train.py 中会自动完成换算（eval_freq = eval_every * n_envs * n_steps）。
 
-# === TensorBoard / 日志 ===
-tensorboard: true          # 是否启用 TensorBoard 日志（train.py 会在 models/<ts>/tb_logs 写入）
-tb_log_dir: tb_logs        # 相对于输出目录的 TB 日志子目录
-log_interval: 1           # 学习更新的日志间隔（默认 1），会传递给 model.learn(...)
+# 模型保存与 summary 控制（单位：optimization-step）
+save_iters: 5000            # 模型保存频率（以 optimization-step 为单位）。含义：每隔多少次完整 rollout+优化 保存一次模型。
+                            # 对应的环境步 = save_iters * n_envs * n_steps。设为 0 则禁用自动周期性保存（仍会保存 best/最终模型）。
+summary_iters: 10           # TensorBoard summary 写入频率（以 optimization-step 为单位）。含义：每隔多少次 rollout/update 向 TB 写入一次统计数据。
 
-# === 保存 / 输出行为 ===
-save_best_model: true      # 是否保存表现最好的模型（由 EvalCallback 实现）
-verbose: 1                 # SB3 的 verbose 级别
+# ----------------- 评估（Eval）配置（单位：optimization-step） -----------------
+# 推荐：使用 optimization-step 为单位可与训练更新对齐（pysc2-rl-agents 的设计即如此）
+eval_every: 10              # 评估频率（optimization-step）。例如 10 表示每 10 次 rollout/update 评估一次。
+n_eval_episodes: 20        # 每次评估运行的 episode 数，用于计算平均回报。
+eval_deterministic: false  # 评估使用确定性策略（True）还是采样策略（False）。True 适合最终性能验证。
+eval_render: false         # 在评估时是否打开渲染（通常设为 false，在离线训练环境中禁用以节省资源）。
+
+# ----------------- TensorBoard / 日志 -----------------
+tensorboard: true          # 是否启用 TensorBoard 日志。启用后会在 outputs 下创建 tb_logs/fundamental 与 tb_logs/extra 两个子目录。
+tb_log_dir: tb_logs        # TB 日志的顶级子目录名（相对于 out_dir），train.py 会在该目录下创建 `fundamental`（主要标量）和 `extra`（优化级别指标）。
+log_interval: 1            # 控制台/日志输出频率（传给 model.learn(..., log_interval)）。单位为 optimization-step（多少次 rollout/update 打印一次）。
+                            # 建议：训练过程实时监控设为 1，长期训练可调大以减少输出。
+
+# ----------------- 保存 / 输出行为 -----------------
+save_best_model: true      # 是否保存最佳模型（由 EvalCallback 实现）。若为 True，会把最佳模型保存到 out_dir。
+verbose: 1                 # SB3 的 verbose 级别（0: 静默，1: 进度信息，2: 详细信息）
+
+# ----------------- 说明与调参建议 -----------------
+# - 关于采样规模：增加 n_envs 能提高样本效率与收敛稳定性，但需要相应增加 CPU/GPU 资源与内存。
+# - 关于优化重复利用（n_epochs）与 batch_size：增大 n_epochs 或减小 batch_size 会增加优化强度（more SGD steps per collected sample），过大可能导致过拟合或不稳定，通常维持 n_epochs=3-10, batch_size=64-256。
+# - 关于汇总频率（summary_iters）与保存频率（save_iters）：选择与训练时长匹配的频率以平衡 I/O，典型值为 summary_iters=5~20, save_iters=1000~10000（取决于模型大小与磁盘空间）。
+# - 如果需要将某些频率按环境步直接设置，请使用：env_steps = opt_steps * n_envs * n_steps，并在 train.py 中进行换算（该项目已实现自动换算）。

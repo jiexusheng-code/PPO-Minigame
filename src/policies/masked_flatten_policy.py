@@ -337,6 +337,7 @@ class MaskedFlattenPolicy(MultiInputPolicy):
 
             slot_used_means = []
             slot_entropy_means = []
+            slot_logprob_means = []
             # slot_ents contains ent * used already; need used statistics per slot
             for i, s_logits in enumerate(slot_logits):
                 size = s_logits.shape[1]
@@ -353,11 +354,24 @@ class MaskedFlattenPolicy(MultiInputPolicy):
                     ent_mean = 0.0
                 slot_used_means.append(used_mean)
                 slot_entropy_means.append(ent_mean)
+                # compute selected log-prob mean for this slot (only over used entries)
+                try:
+                    # slot_logps list contains per-sample picked*used; recover corresponding tensor
+                    picked_vals = slot_logps[i]
+                    if used_sum > 0:
+                        logp_mean = float(picked_vals.sum().detach().cpu().item() / (used_sum + 1e-8))
+                    else:
+                        logp_mean = 0.0
+                except Exception:
+                    logp_mean = 0.0
+                slot_logprob_means.append(logp_mean)
 
             self._last_per_arg_stats = {
                 "fn_entropy_mean": fn_entropy_mean,
+                "fn_logprob_mean": float(fn_selected.mean().detach().cpu().item()) if isinstance(fn_selected, torch.Tensor) else 0.0,
                 "slot_used_mean": slot_used_means,
                 "slot_entropy_mean": slot_entropy_means,
+                "slot_logprob_mean": slot_logprob_means,
             }
         except Exception:
             # non-critical: do not break training if stats computation fails

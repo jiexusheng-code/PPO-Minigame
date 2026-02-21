@@ -44,8 +44,15 @@ def main():
         "learning_rate", "ent_coef", "batch_size", "n_epochs", "gamma", "gae_lambda", "n_steps", "clip_range", "vf_coef", "max_grad_norm"
     ]
     ppo_kwargs = {k: cfg[k] for k in ppo_param_keys if k in cfg}
-    # 读取评估/日志相关配置
-    eval_freq = cfg.get("eval_freq", 10000)
+    # 读取评估/日志相关配置（统一以 optimization-step 为单位）
+    save_iters = cfg.get("save_iters", 5000)
+    summary_iters = cfg.get("summary_iters", 10)
+    eval_every = cfg.get("eval_every", None)
+    if eval_every is None:
+        eval_every = summary_iters
+    # 将 optimization-step 转换为环境 timestep 供 EvalCallback 使用：timesteps = opt_steps * n_envs * n_steps
+    n_steps = int(cfg.get("n_steps", 16))
+    eval_freq = int(eval_every) * n_envs * n_steps
     n_eval_episodes = cfg.get("n_eval_episodes", 5)
     eval_deterministic = cfg.get("eval_deterministic", True)
     eval_render = cfg.get("eval_render", False)
@@ -90,8 +97,10 @@ def main():
         logger.warning(f"无法检测PyTorch设备: {e}")
         device = "cpu"
     checkpoint_path = cfg.get("checkpoint_path", None)
-    # Ensure SB3 writes its default scalars into the env-step subdirectory
-    tb_log_for_sb3 = os.path.join(tb_log, "env-step") if tb_log is not None else None
+    # Disable SB3's internal TensorBoard writer to avoid SB3 creating algorithm-named
+    # subfolders (e.g. PPO_1). Our TBDualWriterCallback will create and manage
+    # `fundamental` and `extra` directories and write scalars there.
+    tb_log_for_sb3 = None
     if checkpoint_path and os.path.isfile(checkpoint_path):
         logger.info(f"[INFO] 从checkpoint加载模型: {checkpoint_path}")
         model = PPO.load(checkpoint_path, env=vec_env, tensorboard_log=tb_log_for_sb3, policy=policy, policy_kwargs=policy_kwargs, device=device, **ppo_kwargs)
@@ -144,7 +153,25 @@ def main():
         callbacks.append(tb_callback)
     callback_list = CallbackList(callbacks)
 
-    model.learn(total_timesteps=total_timesteps, callback=callback_list, log_interval=log_interval)
+    # If total_timesteps <= 0, treat as "run until interrupted"; otherwise run for given timesteps
+    try:
+        tt = int(total_timesteps) if total_timesteps is not None else None
+    except Exception:
+        tt = None
+
+    if tt is None:
+        # if unspecified, require explicit total_timesteps in config
+        raise ValueError("total_timesteps must be specified in config and be a non-negative integer")
+
+    if tt <= 0:
+        logger.info("运行模式: total_timesteps <= 0，持续训练直到手动中断 (Ctrl+C)。")
+        try:
+            while True:
+                model.learn(total_timesteps=10**9, callback=callback_list, reset_num_timesteps=False, log_interval=log_interval)
+        except KeyboardInterrupt:
+            logger.info("检测到 KeyboardInterrupt，停止训练并保存。")
+    else:
+        model.learn(total_timesteps=tt, callback=callback_list, log_interval=log_interval)
     logger.info("训练完成，保存最终模型...")
     model.save(os.path.join(out_dir, f"final_model_{today_str}"))
     def _sanitize_for_yaml(obj):
