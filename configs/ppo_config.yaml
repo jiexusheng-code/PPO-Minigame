@@ -48,7 +48,7 @@ clip_value_loss: false       # 是否对 value loss 使用裁剪（bool），可
 # 例如：n_envs=32, n_steps=16 -> 1 opt-step = 512 env-steps。若需要按环境步设置 EvalCallback，请在 train.py 中会自动完成换算（eval_freq = eval_every * n_envs * n_steps）。
 
 # 模型保存与 summary 控制（单位：optimization-step）
-save_iters: 5000            # 模型保存频率（以 optimization-step 为单位）。含义：每隔多少次完整 rollout+优化 保存一次模型。
+save_iters: 50              # 模型保存频率（以 optimization-step 为单位）。含义：每隔多少次完整 rollout+优化 保存一次模型。
                             # 对应的环境步 = save_iters * n_envs * n_steps。设为 0 则禁用自动周期性保存（仍会保存 best/最终模型）。
 summary_iters: 10           # TensorBoard summary 写入频率（以 optimization-step 为单位）。含义：每隔多少次 rollout/update 向 TB 写入一次统计数据。
 

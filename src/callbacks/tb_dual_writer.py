@@ -45,7 +45,7 @@ class TBDualWriterCallback(BaseCallback):
         except Exception:
             pass
 
-    def _dump_logger_scalars(self, logger, writer, step: int, writer_name: str = "env"):
+    def _dump_logger_scalars(self, logger, writer, step: int, writer_name: str = "env", include_prefixes=None):
         """Write numeric scalars from SB3 logger into provided SummaryWriter."""
         try:
             if logger is None or writer is None:
@@ -63,6 +63,9 @@ class TBDualWriterCallback(BaseCallback):
                     pass
             for k, v in stats.items():
                 try:
+                    if include_prefixes is not None:
+                        if not any(str(k).startswith(p) for p in include_prefixes):
+                            continue
                     if v is None:
                         continue
                     # handle common wrapper types: tuple (value, fmt), objects with .value/.mean, numpy types
@@ -244,7 +247,13 @@ class TBDualWriterCallback(BaseCallback):
                 logger = getattr(getattr(self, 'model', None), 'logger', None)
                 n_updates = self._get_logger_n_updates(logger)
                 if n_updates is not None and n_updates != self._last_n_updates:
-                    self._dump_logger_scalars(logger, self.env_writer, int(self.opt_step), writer_name="env")
+                    self._dump_logger_scalars(
+                        logger,
+                        self.env_writer,
+                        int(self.opt_step),
+                        writer_name="env",
+                        include_prefixes=("train/",),
+                    )
                     self._last_n_updates = n_updates
         except Exception:
             pass
@@ -295,6 +304,28 @@ class TBDualWriterCallback(BaseCallback):
             # write using optimization-step as x-axis (treat rollout count as primary step)
             if (self.opt_step % self.write_env_every) == 0 and self.env_writer is not None:
                 self._safe_add_scalar("env", self.env_writer, "training/num_timesteps", num_ts, int(self.opt_step))
+                # write non-train scalar groups on rollout boundary
+                try:
+                    logger = getattr(self.model, "logger", None)
+                    self._dump_logger_scalars(
+                        logger,
+                        self.env_writer,
+                        int(self.opt_step),
+                        writer_name="env",
+                        include_prefixes=("eval/", "rollout/", "time/"),
+                    )
+                except Exception:
+                    pass
+                # robust eval metric export (independent of logger internals)
+                try:
+                    eval_stats = getattr(self.model, "_last_eval_stats", None)
+                    if isinstance(eval_stats, dict):
+                        if "mean_reward" in eval_stats:
+                            self._safe_add_scalar("env", self.env_writer, "eval/mean_reward", float(eval_stats["mean_reward"]), int(self.opt_step))
+                        if "mean_ep_length" in eval_stats:
+                            self._safe_add_scalar("env", self.env_writer, "eval/mean_ep_length", float(eval_stats["mean_ep_length"]), int(self.opt_step))
+                except Exception:
+                    pass
         except Exception:
             pass
 

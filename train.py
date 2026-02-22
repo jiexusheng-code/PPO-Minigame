@@ -174,6 +174,21 @@ def main():
                 self._logger.info(
                     f"[EvalCallback] 评估完成: num_timesteps={self.num_timesteps}, last_mean_reward={self.last_mean_reward}"
                 )
+                # expose latest eval stats for external callbacks (e.g. TB dual writer)
+                try:
+                    eval_stats = {
+                        "mean_reward": float(self.last_mean_reward),
+                        "timesteps": int(self.num_timesteps),
+                        "n_eval_episodes": int(self.n_eval_episodes),
+                    }
+                    try:
+                        if getattr(self, 'evaluations_length', None) is not None and len(self.evaluations_length) > 0:
+                            eval_stats["mean_ep_length"] = float(self.evaluations_length[-1].mean())
+                    except Exception:
+                        pass
+                    setattr(self.model, '_last_eval_stats', eval_stats)
+                except Exception:
+                    pass
                 # if configured to keep only best, and a new best was found, remove periodic checkpoints
                 try:
                     new_best = getattr(self, 'best_mean_reward', float('-inf'))
