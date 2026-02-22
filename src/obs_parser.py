@@ -282,6 +282,7 @@ class ObsParser:
         """
         layers = []
         import re
+        from scipy import ndimage
 
         def _get_layer_index(layer_feature):
             if hasattr(layer_feature, "index"):
@@ -294,6 +295,8 @@ class ObsParser:
                 if m:
                     return int(m.group(1))
                 raise RuntimeError(f"无法解析 screen layer feature: {layer_feature}")
+
+        # (no debug prints)
 
         for layer_feature, _name in self.config.screen_layers:
             li = _get_layer_index(layer_feature)
@@ -343,8 +346,27 @@ class ObsParser:
 
             # 注意：不在 parser 内置零，保留原始层值；mask 由 screen_layer_flags 提供
 
-            # 添加通道维度并收集
+            # 添加通道维度
             cdata = np.expand_dims(cdata, axis=-1)
+            # 如果需要，将每一层按类型单独 resize：categorical -> nearest (order=0)，scalar -> bilinear (order=1)
+            try:
+                h, w = cdata.shape[0], cdata.shape[1]
+                if h != self.screen_size or w != self.screen_size:
+                    order = 0 if is_categorical else 1
+                    zoom_factors = (self.screen_size / float(h), self.screen_size / float(w))
+                    resized = ndimage.zoom(cdata[:, :, 0], zoom_factors, order=order)
+                    # crop or pad to exact target size
+                    if resized.shape[0] > self.screen_size or resized.shape[1] > self.screen_size:
+                        resized = resized[: self.screen_size, : self.screen_size]
+                    elif resized.shape[0] < self.screen_size or resized.shape[1] < self.screen_size:
+                        pad_h = self.screen_size - resized.shape[0]
+                        pad_w = self.screen_size - resized.shape[1]
+                        resized = np.pad(resized, ((0, pad_h), (0, pad_w)), mode='constant', constant_values=0)
+                    cdata = np.expand_dims(resized, axis=-1)
+            except Exception:
+                # fallback: keep original cdata
+                pass
+
             layers.append(cdata)
 
         # 拼接所有层（若空则返回全零占位）
@@ -353,7 +375,7 @@ class ObsParser:
         else:
             screen = np.concatenate(layers, axis=-1)  # (H, W, C)
 
-        # 缩放到目标尺寸
+        # 最终合并后尺寸应已为目标尺寸（若输入层已对齐）。若仍不匹配，依然使用统一缩放作为后备。
         screen = self._resize_spatial(screen, self.screen_size)
 
         return screen.astype(np.float32)
@@ -366,6 +388,9 @@ class ObsParser:
         """
         layers = []
         import re
+        from scipy import ndimage
+
+        # (no debug prints)
 
         def _get_layer_index(layer_feature):
             if hasattr(layer_feature, "index"):
@@ -422,6 +447,21 @@ class ObsParser:
                     cdata = cdata / float(scale - 1)
 
             cdata = np.expand_dims(cdata, axis=-1)
+            try:
+                h, w = cdata.shape[0], cdata.shape[1]
+                if h != self.minimap_size or w != self.minimap_size:
+                    order = 0 if is_categorical else 1
+                    zoom_factors = (self.minimap_size / float(h), self.minimap_size / float(w))
+                    resized = ndimage.zoom(cdata[:, :, 0], zoom_factors, order=order)
+                    if resized.shape[0] > self.minimap_size or resized.shape[1] > self.minimap_size:
+                        resized = resized[: self.minimap_size, : self.minimap_size]
+                    elif resized.shape[0] < self.minimap_size or resized.shape[1] < self.minimap_size:
+                        pad_h = self.minimap_size - resized.shape[0]
+                        pad_w = self.minimap_size - resized.shape[1]
+                        resized = np.pad(resized, ((0, pad_h), (0, pad_w)), mode='constant', constant_values=0)
+                    cdata = np.expand_dims(resized, axis=-1)
+            except Exception:
+                pass
             layers.append(cdata)
 
         if len(layers) == 0:

@@ -1,6 +1,7 @@
 """Minimal training launcher using stable-baselines3 PPO, driven by config file."""
 
 import os
+import glob
 import yaml
 import logging
 from stable_baselines3 import PPO
@@ -26,40 +27,53 @@ def load_config(path: str):
 def main():
 
     cfg = load_config(DEFAULT_CONFIG_PATH)
-    env_name = cfg.get("env", "MoveToBeacon")
+    # Strict config access: require keys to be present in the config file.
+    def require(key: str):
+        if key not in cfg:
+            raise KeyError(f"Required config key '{key}' missing from {DEFAULT_CONFIG_PATH}")
+        return cfg[key]
+
+    # forbid legacy/ambiguous key 'eval_freq' to avoid silent misconfiguration
+    if "eval_freq" in cfg:
+        raise ValueError("Config key 'eval_freq' is not supported; use 'eval_every' (optimization-step units) instead.")
+
+    env_name = require("env")
     import datetime
     today_str = datetime.datetime.now().strftime("%Y%m%d%H")
-    base_dir = os.path.join("models", today_str)
+    # Use user-provided out_dir as base path (required). Timestamped subfolder will be created inside it.
+    out_dir_root = require("out_dir")
+    base_dir = os.path.join(out_dir_root, today_str)
     out_dir = base_dir
-    n_envs = cfg.get("n_envs", 1)
-    seed = cfg.get("seed", 0)
-    total_timesteps = cfg.get("total_timesteps", 100000)
-    policy = MaskedFlattenPolicy if cfg.get("policy", "MaskedFlattenPolicy") == "MaskedFlattenPolicy" else cfg["policy"]
-    policy_kwargs = cfg.get("policy_kwargs", {})
+    n_envs = require("n_envs")
+    seed = require("seed")
+    total_timesteps = require("total_timesteps")
+    policy_cfg = require("policy")
+    policy = MaskedFlattenPolicy if policy_cfg == "MaskedFlattenPolicy" else policy_cfg
+    policy_kwargs = require("policy_kwargs")
     if policy is MaskedFlattenPolicy and "features_extractor_class" not in policy_kwargs:
         policy_kwargs["features_extractor_class"] = VectorLayerNormExtractor
-    env_kwargs = cfg.get("env_kwargs", {})
+    env_kwargs = require("env_kwargs")
     os.makedirs(out_dir, exist_ok=True)
     ppo_param_keys = [
         "learning_rate", "ent_coef", "batch_size", "n_epochs", "gamma", "gae_lambda", "n_steps", "clip_range", "vf_coef", "max_grad_norm"
     ]
-    ppo_kwargs = {k: cfg[k] for k in ppo_param_keys if k in cfg}
+    # require all PPO params to be explicitly provided in config
+    ppo_kwargs = {k: require(k) for k in ppo_param_keys}
     # 读取评估/日志相关配置（统一以 optimization-step 为单位）
-    save_iters = cfg.get("save_iters", 5000)
-    summary_iters = cfg.get("summary_iters", 10)
-    eval_every = cfg.get("eval_every", None)
-    if eval_every is None:
-        eval_every = summary_iters
+    save_iters = require("save_iters")
+    summary_iters = require("summary_iters")
+    # eval_every must be provided explicitly (optimization-step units)
+    eval_every = require("eval_every")
     # 将 optimization-step 转换为环境 timestep 供 EvalCallback 使用：timesteps = opt_steps * n_envs * n_steps
-    n_steps = int(cfg.get("n_steps", 16))
+    n_steps = int(require("n_steps"))
     eval_freq = int(eval_every) * n_envs * n_steps
-    n_eval_episodes = cfg.get("n_eval_episodes", 5)
-    eval_deterministic = cfg.get("eval_deterministic", True)
-    eval_render = cfg.get("eval_render", False)
-    tensorboard = cfg.get("tensorboard", True)
-    tb_log_dirname = cfg.get("tb_log_dir", "tb_logs")
-    save_best_model = cfg.get("save_best_model", True)
-    verbose_level = cfg.get("verbose", 1)
+    n_eval_episodes = require("n_eval_episodes")
+    eval_deterministic = require("eval_deterministic")
+    eval_render = require("eval_render")
+    tensorboard = require("tensorboard")
+    tb_log_dirname = require("tb_log_dir")
+    save_best_model = require("save_best_model")
+    verbose_level = require("verbose")
     env_fn = make_env_fn(env_name, env_kwargs)
     vec_env = make_vec_env(env_fn, n_envs=n_envs, seed=seed, wrapper_class=Monitor)
     tb_log = os.path.join(base_dir, tb_log_dirname) if tensorboard else None
@@ -96,7 +110,13 @@ def main():
     except Exception as e:
         logger.warning(f"无法检测PyTorch设备: {e}")
         device = "cpu"
-    checkpoint_path = cfg.get("checkpoint_path", None)
+    # checkpoint_path is optional: if provided in the config it must be present as a key (can be empty to mean None)
+    if "checkpoint_path" in cfg:
+        checkpoint_path = cfg["checkpoint_path"]
+        if checkpoint_path in (None, ""):
+            checkpoint_path = None
+    else:
+        checkpoint_path = None
     # Disable SB3's internal TensorBoard writer to avoid SB3 creating algorithm-named
     # subfolders (e.g. PPO_1). Our TBDualWriterCallback will create and manage
     # `fundamental` and `extra` directories and write scalars there.
@@ -105,14 +125,26 @@ def main():
         logger.info(f"[INFO] 从checkpoint加载模型: {checkpoint_path}")
         model = PPO.load(checkpoint_path, env=vec_env, tensorboard_log=tb_log_for_sb3, policy=policy, policy_kwargs=policy_kwargs, device=device, **ppo_kwargs)
     else:
+        # honor clip_value_loss config: when True, pass clip_range_vf to SB3 if supported
+        clip_value_loss_flag = False
+        if "clip_value_loss" in cfg:
+            clip_value_loss_flag = cfg["clip_value_loss"]
+            if clip_value_loss_flag:
+                # set clip_range_vf equal to clip_range (user-provided)
+                try:
+                    ppo_kwargs["clip_range_vf"] = ppo_kwargs["clip_range"]
+                except Exception:
+                    pass
         model = PPO(policy, vec_env, verbose=verbose_level, tensorboard_log=tb_log_for_sb3, policy_kwargs=policy_kwargs, device=device, **ppo_kwargs)
     # 使用EvalCallback只保存表现最好的模型
     eval_env = make_vec_env(env_fn, n_envs=1, seed=seed+100, wrapper_class=Monitor)
     best_model_save_path = out_dir if save_best_model else None
     class LogEvalCallback(EvalCallback):
-        def __init__(self, *args, logger=None, **kwargs):
+        def __init__(self, *args, logger=None, save_best_only: bool = False, checkpoint_dir: str = None, **kwargs):
             super().__init__(*args, **kwargs)
             self._logger = logger or logging.getLogger("train")
+            self._save_best_only = bool(save_best_only)
+            self._checkpoint_dir = checkpoint_dir
 
         def _on_step(self) -> bool:
             do_eval = self.eval_freq > 0 and self.n_calls % self.eval_freq == 0
@@ -120,11 +152,26 @@ def main():
                 self._logger.info(
                     f"[EvalCallback] 触发评估: num_timesteps={self.num_timesteps}, n_calls={self.n_calls}, eval_freq={self.eval_freq}"
                 )
+            # remember previous best to detect improvement after super
+            prev_best = getattr(self, 'best_mean_reward', float('-inf'))
             result = super()._on_step()
             if do_eval:
                 self._logger.info(
                     f"[EvalCallback] 评估完成: num_timesteps={self.num_timesteps}, last_mean_reward={self.last_mean_reward}"
                 )
+                # if configured to keep only best, and a new best was found, remove periodic checkpoints
+                try:
+                    new_best = getattr(self, 'best_mean_reward', float('-inf'))
+                    if self._save_best_only and self._checkpoint_dir is not None and new_best != prev_best:
+                        # remove checkpoint_opt_*.zip files in checkpoint_dir
+                        pattern = os.path.join(self._checkpoint_dir, 'checkpoint_opt_*.zip')
+                        for path in glob.glob(pattern):
+                            try:
+                                os.remove(path)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
             return result
 
     eval_callback = LogEvalCallback(
@@ -135,7 +182,9 @@ def main():
         deterministic=eval_deterministic,
         render=eval_render,
         n_eval_episodes=n_eval_episodes,
-        logger=logger
+        logger=logger,
+        save_best_only=save_best_model,
+        checkpoint_dir=out_dir,
     )
     logger.info(
         f"[EvalCallback] 有效评估频率: eval_freq={eval_callback.eval_freq} (n_envs={vec_env.num_envs})"
@@ -144,12 +193,18 @@ def main():
     logger.info(f"评估频率(eval_freq): {eval_freq}, 每次评估episode数: {n_eval_episodes}, 保存最佳模型: {save_best_model}")
     logger.info(f"TensorBoard: {'启用' if tensorboard and tb_log else '禁用'}, TB目录: {tb_log}")
     # 日志/打印间隔（多少次学习更新写一次日志）
-    log_interval = cfg.get("log_interval", 1)
+    log_interval = require("log_interval")
     logger.info(f"日志间隔(log_interval): {log_interval}")
     # attach dual-writer callback together with EvalCallback
     callbacks = [eval_callback]
     if tensorboard and tb_log:
-        tb_callback = TBDualWriterCallback(tb_log)
+        tb_callback = TBDualWriterCallback(
+            tb_log,
+            write_env_every=summary_iters,
+            write_opt_every=summary_iters,
+            save_every=save_iters,
+            save_dir=out_dir,
+        )
         callbacks.append(tb_callback)
     callback_list = CallbackList(callbacks)
 
@@ -186,6 +241,18 @@ def main():
     with open(os.path.join(out_dir, "config_used.yaml"), "w", encoding="utf-8") as f:
         yaml.safe_dump(_sanitize_for_yaml(cfg), f, allow_unicode=True)
     logger.info("配置已保存: config_used.yaml")
+    # If configured to only keep best, remove periodic checkpoint files created during training
+    try:
+        if save_best_model:
+            pattern = os.path.join(out_dir, 'checkpoint_opt_*.zip')
+            for path in glob.glob(pattern):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+            logger.info("已清理周期性 checkpoint，只保留最佳/最终模型（save_best_model=True）。")
+    except Exception:
+        pass
 
 if __name__ == "__main__":
     # 修复 pysc2 的 shuffled_hue 问题，兼容 Python 3.9+

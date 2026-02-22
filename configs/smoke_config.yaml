@@ -13,6 +13,7 @@ env_kwargs:
   step_mul: 8
   visualize: false
 total_timesteps: 512
+save_iters: 1
 learning_rate: 1.5e-4
 ent_coef: 0.02
 batch_size: 64
@@ -23,12 +24,13 @@ n_steps: 64
 clip_range: 0.15
 vf_coef: 0.5
 max_grad_norm: 0.5
-eval_freq: 1000000
+eval_every: 1
 n_eval_episodes: 1
 eval_deterministic: false
 eval_render: false
 tensorboard: true
 tb_log_dir: tb_logs
 log_interval: 1
-save_best_model: false
+save_best_model: true
 verbose: 1
+summary_iters: 1
