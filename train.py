@@ -132,10 +132,10 @@ def main():
             checkpoint_path = None
     else:
         checkpoint_path = None
-    # Disable SB3's internal TensorBoard writer to avoid SB3 creating algorithm-named
-    # subfolders (e.g. PPO_1). Our TBDualWriterCallback will create and manage
-    # `fundamental` and `extra` directories and write scalars there.
-    tb_log_for_sb3 = None
+    # Allow SB3 to write its internal TensorBoard event files into the same
+    # tb directory so we can mirror any SB3-default scalars into our
+    # `fundamental` writer; keep disabled when tensorboard is False.
+    tb_log_for_sb3 = tb_log if tensorboard and tb_log else None
     if checkpoint_path and os.path.isfile(checkpoint_path):
         logger.info(f"[INFO] 从checkpoint加载模型: {checkpoint_path}")
         model = PPO.load(checkpoint_path, env=vec_env, tensorboard_log=tb_log_for_sb3, policy=policy, policy_kwargs=policy_kwargs, device=device, **ppo_kwargs)

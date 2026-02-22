@@ -306,6 +306,11 @@ class TBDualWriterCallback(BaseCallback):
                 self._safe_add_scalar("env", self.env_writer, "training/num_timesteps", num_ts, int(self.opt_step))
                 # write non-train scalar groups on rollout boundary
                 try:
+                    # mirror any SB3-created event files into fundamental first
+                    try:
+                        self._mirror_sb3_tb_to_fundamental()
+                    except Exception:
+                        pass
                     logger = getattr(self.model, "logger", None)
                     self._dump_logger_scalars(
                         logger,
@@ -470,7 +475,7 @@ class TBDualWriterCallback(BaseCallback):
                         val = float(ev.value)
                         # write into fundamental using current opt_step
                         try:
-                            self.env_writer.add_scalar(tag, val, int(self.opt_step))
+                            self._safe_add_scalar('env', self.env_writer, tag, float(val), int(self.opt_step))
                         except Exception:
                             continue
                     except Exception:
