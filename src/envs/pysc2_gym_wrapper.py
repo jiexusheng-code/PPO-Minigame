@@ -20,6 +20,7 @@ class PySC2GymEnv(gym.Env):
         minimap_size: int = 32,
         step_mul: int = 8,
         visualize: bool = False,
+        reset_jitter_max_steps: int = 0,
     ):
         import logging, os, datetime
         super().__init__()
@@ -28,6 +29,7 @@ class PySC2GymEnv(gym.Env):
         self.minimap_size = minimap_size 
         self.step_mul = step_mul
         self.visualize = visualize
+        self.reset_jitter_max_steps = max(0, int(reset_jitter_max_steps))
         self._step_count = 0  # 记录步数
 
         # 日志设置：只用主进程的logging.basicConfig，所有模块共用同一日志文件
@@ -205,6 +207,28 @@ class PySC2GymEnv(gym.Env):
         self._lazy_init()
         timesteps = self._env.reset()
         self.timestep = timesteps[0]
+
+        # Optional reset jitter: execute random no-op steps to desynchronize parallel env episode boundaries.
+        if self.reset_jitter_max_steps > 0:
+            try:
+                if hasattr(self, "np_random") and self.np_random is not None:
+                    jitter_steps = int(self.np_random.integers(0, self.reset_jitter_max_steps + 1))
+                else:
+                    jitter_steps = int(np.random.randint(0, self.reset_jitter_max_steps + 1))
+            except Exception:
+                jitter_steps = 0
+
+            for _ in range(jitter_steps):
+                try:
+                    no_op = self.actions.FUNCTIONS.no_op()
+                    timesteps = self._env.step([no_op])
+                    self.timestep = timesteps[0]
+                    if bool(self.timestep.last()):
+                        timesteps = self._env.reset()
+                        self.timestep = timesteps[0]
+                except Exception:
+                    break
+
         obs_dict = self._obs_to_space(self.timestep)
         info = {}
         return obs_dict, info

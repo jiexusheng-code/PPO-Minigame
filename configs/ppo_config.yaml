@@ -20,6 +20,7 @@ env_kwargs:
   minimap_size: 32
   step_mul: 8
   visualize: false
+  reset_jitter_max_steps: 15
 
 # ----------------- 训练时长 -----------------
 # total_timesteps 的单位为 环境交互步（environment-steps）。
