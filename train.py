@@ -59,6 +59,16 @@ def main():
     ]
     # require all PPO params to be explicitly provided in config
     ppo_kwargs = {k: require(k) for k in ppo_param_keys}
+    # Ensure numeric PPO params are proper types (yaml may load exponent as string)
+    try:
+        lr = ppo_kwargs.get("learning_rate")
+        if isinstance(lr, str):
+            try:
+                ppo_kwargs["learning_rate"] = float(lr)
+            except Exception:
+                pass
+    except Exception:
+        pass
     # 读取评估/日志相关配置（统一以 optimization-step 为单位）
     save_iters = require("save_iters")
     summary_iters = require("summary_iters")
