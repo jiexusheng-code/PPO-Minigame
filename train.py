@@ -87,6 +87,11 @@ def main():
     env_fn = make_env_fn(env_name, env_kwargs)
     vec_env = make_vec_env(env_fn, n_envs=n_envs, seed=seed, wrapper_class=Monitor)
     tb_log = os.path.join(base_dir, tb_log_dirname) if tensorboard else None
+    # expose output dir to worker envs so they can write verification snapshots there
+    try:
+        os.environ['TRAIN_OUT_DIR'] = base_dir
+    except Exception:
+        pass
     log_dir = os.path.join(base_dir, "logs")
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, "train.log")

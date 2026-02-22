@@ -105,6 +105,24 @@ class PySC2GymEnv(gym.Env):
                 self._fn_param_map[fn.id] = slot_indices
             self._max_args = len(param_semantics)
             self.action_space = gym.spaces.MultiDiscrete([n_funcs] + arg_sizes)
+            # write a one-time snapshot of param semantics to disk for cross-checking
+            try:
+                import json, os
+                snapshot = {
+                    'param_semantics': self._param_semantics,
+                    'param_size_dict': self._param_size_dict,
+                }
+                out_dir = os.environ.get('TRAIN_OUT_DIR', None)
+                if out_dir is None:
+                    path = os.path.join(os.getcwd(), 'param_semantics_env.json')
+                else:
+                    os.makedirs(out_dir, exist_ok=True)
+                    path = os.path.join(out_dir, 'param_semantics_env.json')
+                with open(path, 'w', encoding='utf-8') as f:
+                    json.dump(snapshot, f, ensure_ascii=False, indent=2)
+                self.logger.info(f"Wrote param semantics snapshot to {path}")
+            except Exception:
+                pass
         except Exception as e:
             self.logger.error(f"构建动作空间失败: {e}")
             raise RuntimeError(f"构建动作空间失败: {e}") from e

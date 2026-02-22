@@ -273,6 +273,104 @@ class MaskedFlattenPolicy(MultiInputPolicy):
         self._slot_sizes = slot_sizes
         self._fn_slot_mask = fn_slot_mask.to(device) if device is not None else fn_slot_mask
         self._slot_map_built = True
+        # One-time cross-check against environment snapshot (if present)
+        try:
+            import json, os, logging
+            if not getattr(self, '_param_semantics_checked', False):
+                env_path = os.path.join(os.getcwd(), 'param_semantics_env.json')
+                if os.path.isfile(env_path):
+                    try:
+                        with open(env_path, 'r', encoding='utf-8') as f:
+                            snap = json.load(f)
+                        env_sem = snap.get('param_semantics')
+                        if env_sem is not None and env_sem != self._param_semantics:
+                            logging.getLogger('train').warning(
+                                'param_semantics mismatch between env and policy.\n'
+                                f'env (first 10): {env_sem[:10]}\n'
+                                f'policy (first 10): {self._param_semantics[:10]}\n'
+                                'Saved env snapshot to param_semantics_env.json; please verify mapping.'
+                            )
+                        # mark checked so we don't spam
+                        self._param_semantics_checked = True
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        # Build spatial action heads (minimal: small conv -> 1-channel spatial logits)
+        try:
+            obs_space = getattr(self, 'observation_space', None)
+            if obs_space is not None and hasattr(obs_space, 'spaces'):
+                # screen
+                screen_space = obs_space.spaces.get('screen')
+                if screen_space is not None:
+                    sh = screen_space.shape
+                    if len(sh) == 3:
+                        # (H, W, C)
+                        screen_in_ch = int(sh[2])
+                    else:
+                        screen_in_ch = None
+                else:
+                    screen_in_ch = None
+
+                minimap_space = obs_space.spaces.get('minimap')
+                if minimap_space is not None:
+                    mh = minimap_space.shape
+                    if len(mh) == 3:
+                        minimap_in_ch = int(mh[2])
+                    else:
+                        minimap_in_ch = None
+                else:
+                    minimap_in_ch = None
+
+                # find indices of 'screen'/'minimap' in slot semantics
+                try:
+                    self._screen_slot_idx = self._param_semantics.index('screen') if 'screen' in self._param_semantics else None
+                except Exception:
+                    self._screen_slot_idx = None
+                try:
+                    self._minimap_slot_idx = self._param_semantics.index('minimap') if 'minimap' in self._param_semantics else None
+                except Exception:
+                    self._minimap_slot_idx = None
+
+                import torch.nn as nn
+                # create small conv heads when channels and slot indices are available
+                if screen_in_ch is not None and self._screen_slot_idx is not None:
+                    # simple two-layer conv producing 1-channel spatial logits
+                    self._screen_spatial_net = nn.Sequential(
+                        nn.Conv2d(screen_in_ch, 32, kernel_size=3, padding=1),
+                        nn.ReLU(),
+                        nn.Conv2d(32, 1, kernel_size=1)
+                    )
+                    self._screen_in_ch = screen_in_ch
+                    try:
+                        # learnable scale for spatial logits to control softmax sharpness
+                        self._screen_spatial_scale = nn.Parameter(torch.tensor(1.0))
+                    except Exception:
+                        self._screen_spatial_scale = None
+                else:
+                    self._screen_spatial_net = None
+                    self._screen_in_ch = None
+
+                if minimap_in_ch is not None and self._minimap_slot_idx is not None:
+                    self._minimap_spatial_net = nn.Sequential(
+                        nn.Conv2d(minimap_in_ch, 32, kernel_size=3, padding=1),
+                        nn.ReLU(),
+                        nn.Conv2d(32, 1, kernel_size=1)
+                    )
+                    self._minimap_in_ch = minimap_in_ch
+                    try:
+                        self._minimap_spatial_scale = nn.Parameter(torch.tensor(1.0))
+                    except Exception:
+                        self._minimap_spatial_scale = None
+                else:
+                    self._minimap_spatial_net = None
+                    self._minimap_in_ch = None
+        except Exception:
+            # non-critical
+            self._screen_spatial_net = None
+            self._minimap_spatial_net = None
+            self._screen_slot_idx = None
+            self._minimap_slot_idx = None
 
     def _joint_logprob_and_entropy(self, logits: torch.Tensor, actions: torch.Tensor):
         """Compute joint log_prob and entropy while ignoring unused arg slots per-sample.
@@ -413,12 +511,86 @@ class MaskedFlattenPolicy(MultiInputPolicy):
             total = total + expected_usage[:, i] * ent
         return total
 
+    def _inject_spatial_logits(self, logits: torch.Tensor, obs):
+        """Replace flat slot logits with spatial-head logits computed from obs['screen']/['minimap'].
+
+        This keeps the external MultiDiscrete action interface but changes how spatial slot
+        logits are produced (from a spatial conv map flattened to match slot size).
+        """
+        import torch
+        if not isinstance(logits, torch.Tensor):
+            return logits
+        device = logits.device
+        sizes = list(self.action_space.nvec)
+        func_dim = int(sizes[0])
+        slot_sizes = [int(x) for x in sizes[1:]]
+
+        # helper: inject for a single head
+        def _inject(net, slot_idx, in_ch, key):
+            if net is None or slot_idx is None:
+                return
+            if key not in obs:
+                return
+            x = obs[key]
+            if not isinstance(x, torch.Tensor):
+                try:
+                    x = torch.as_tensor(x, device=device)
+                except Exception:
+                    return
+            x = x.float().to(device)
+            if x.dim() != 4:
+                return
+            # accept (B,H,W,C) or (B,C,H,W)
+            if x.shape[-1] == in_ch:
+                x_t = x.permute(0, 3, 1, 2)
+            elif x.shape[1] == in_ch:
+                x_t = x
+            else:
+                return
+            try:
+                out_map = net(x_t)  # (B,1,H,W)
+                out_flat = out_map.view(out_map.shape[0], -1)
+            except Exception:
+                return
+            # apply learnable scale if present to control numeric magnitude
+            try:
+                if slot_idx is not None:
+                    if key == 'screen' and getattr(self, '_screen_spatial_scale', None) is not None:
+                        scale = getattr(self, '_screen_spatial_scale')
+                        out_flat = out_flat * float(scale)
+                    if key == 'minimap' and getattr(self, '_minimap_spatial_scale', None) is not None:
+                        scale = getattr(self, '_minimap_spatial_scale')
+                        out_flat = out_flat * float(scale)
+            except Exception:
+                pass
+            slot_size = slot_sizes[slot_idx]
+            if out_flat.shape[1] != slot_size:
+                if out_flat.shape[1] > slot_size:
+                    out_flat = out_flat[:, :slot_size]
+                else:
+                    out_flat = F.pad(out_flat, (0, slot_size - out_flat.shape[1]))
+            start = func_dim + sum(slot_sizes[:slot_idx])
+            end = start + slot_size
+            logits[:, start:end] = out_flat
+
+        try:
+            _inject(getattr(self, '_screen_spatial_net', None), getattr(self, '_screen_slot_idx', None), getattr(self, '_screen_in_ch', None), 'screen')
+            _inject(getattr(self, '_minimap_spatial_net', None), getattr(self, '_minimap_slot_idx', None), getattr(self, '_minimap_in_ch', None), 'minimap')
+        except Exception:
+            pass
+        return logits
+
     def _get_masked_distribution(self, obs):
         features = self.extract_features(obs)
         latent_pi, _ = self.mlp_extractor(features)
         logits = self.action_net(latent_pi)
         if isinstance(self.action_dist, MultiCategoricalDistribution) and "available_actions" in obs:
             logits = self._apply_action_mask(logits, obs["available_actions"])
+        # inject spatial logits (screen/minimap) if available
+        try:
+            logits = self._inject_spatial_logits(logits, obs)
+        except Exception:
+            pass
         base_dist = self.action_dist.proba_distribution(logits)
 
         # Wrapper to override log_prob and entropy using joint per-slot masking
@@ -461,6 +633,13 @@ class MaskedFlattenPolicy(MultiInputPolicy):
         if isinstance(self.action_dist, MultiCategoricalDistribution) and "available_actions" in obs:
             logits = self._apply_action_mask(logits, obs["available_actions"])
 
+        # inject spatial logits (screen/minimap) so flat slots for spatial args come
+        # from spatial conv maps instead of learned flat heads
+        try:
+            logits = self._inject_spatial_logits(logits, obs)
+        except Exception:
+            pass
+
         # 3. 构造分布并采样，确保每个头只采样唯一语义参数
         distribution = self.action_dist.proba_distribution(logits)
         actions = distribution.get_actions(deterministic=deterministic)
@@ -489,6 +668,12 @@ class MaskedFlattenPolicy(MultiInputPolicy):
         logits = self.action_net(latent_pi)
         if isinstance(self.action_dist, MultiCategoricalDistribution) and "available_actions" in obs:
             logits = self._apply_action_mask(logits, obs["available_actions"])
+
+        # ensure evaluation uses same injected spatial logits
+        try:
+            logits = self._inject_spatial_logits(logits, obs)
+        except Exception:
+            pass
 
         # compute joint log_prob and entropy using sample-level mask
         if not isinstance(actions, torch.Tensor):
