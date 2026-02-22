@@ -277,8 +277,16 @@ class MaskedFlattenPolicy(MultiInputPolicy):
         try:
             import json, os, logging
             if not getattr(self, '_param_semantics_checked', False):
-                env_path = os.path.join(os.getcwd(), 'param_semantics_env.json')
-                if os.path.isfile(env_path):
+                candidate_paths = []
+                train_out_dir = os.environ.get('TRAIN_OUT_DIR', None)
+                if train_out_dir:
+                    candidate_paths.append(os.path.join(train_out_dir, 'param_semantics_env.json'))
+                candidate_paths.append(os.path.join(os.getcwd(), 'models', 'param_semantics_env.json'))
+                # backward compatibility with historical root-level snapshot
+                candidate_paths.append(os.path.join(os.getcwd(), 'param_semantics_env.json'))
+
+                env_path = next((p for p in candidate_paths if os.path.isfile(p)), None)
+                if env_path is not None:
                     try:
                         with open(env_path, 'r', encoding='utf-8') as f:
                             snap = json.load(f)

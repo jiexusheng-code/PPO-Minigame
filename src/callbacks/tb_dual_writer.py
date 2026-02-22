@@ -30,8 +30,22 @@ class TBDualWriterCallback(BaseCallback):
         self._last_n_updates = None
         # track SB3 event files we have mirrored already to avoid duplicate processing
         self._processed_sb3_files = set()
+        # de-dup guard: ensure (writer, tag, step) is written at most once
+        self._written_scalar_keys = set()
 
-    def _dump_logger_scalars(self, logger, writer, step: int):
+    def _safe_add_scalar(self, writer_name: str, writer: Optional[SummaryWriter], tag: str, value: float, step: int):
+        try:
+            if writer is None:
+                return
+            k = (str(writer_name), str(tag), int(step))
+            if k in self._written_scalar_keys:
+                return
+            writer.add_scalar(tag, float(value), int(step))
+            self._written_scalar_keys.add(k)
+        except Exception:
+            pass
+
+    def _dump_logger_scalars(self, logger, writer, step: int, writer_name: str = "env"):
         """Write numeric scalars from SB3 logger into provided SummaryWriter."""
         try:
             if logger is None or writer is None:
@@ -76,7 +90,7 @@ class TBDualWriterCallback(BaseCallback):
                             val = float(list(candidate)[0])
                         except Exception:
                             continue
-                    writer.add_scalar(k, val, int(step))
+                    self._safe_add_scalar(writer_name, writer, k, val, int(step))
                 except Exception:
                     continue
         except Exception:
@@ -96,9 +110,10 @@ class TBDualWriterCallback(BaseCallback):
         # with the correct step semantics.
         try:
             class _OptStepTBOutputFormat:
-                def __init__(self, writer, get_step_fn):
+                def __init__(self, writer, get_step_fn, add_scalar_fn):
                     self.writer = writer
                     self.get_step = get_step_fn
+                    self.add_scalar = add_scalar_fn
 
                 def writekvs(self, kvs):
                     try:
@@ -127,7 +142,7 @@ class TBDualWriterCallback(BaseCallback):
                                     except Exception:
                                         continue
                                 try:
-                                    self.writer.add_scalar(k, val, step)
+                                    self.add_scalar(k, val, step)
                                 except Exception:
                                     continue
                             except Exception:
@@ -165,7 +180,13 @@ class TBDualWriterCallback(BaseCallback):
                             already = True
                             break
                     if not already:
-                        existing_list.append(_OptStepTBOutputFormat(self.env_writer, lambda: self.opt_step))
+                        existing_list.append(
+                            _OptStepTBOutputFormat(
+                                self.env_writer,
+                                lambda: self.opt_step,
+                                lambda tag, value, step: self._safe_add_scalar("env", self.env_writer, tag, value, step),
+                            )
+                        )
                         try:
                             model_logger.output_formats = existing_list
                         except Exception:
@@ -206,51 +227,25 @@ class TBDualWriterCallback(BaseCallback):
                         step = int(self._episode_counter)
                         try:
                             if score is not None and self.opt_writer is not None:
-                                self.opt_writer.add_scalar('sc2/episode_score', float(score), step)
+                                self._safe_add_scalar('opt', self.opt_writer, 'sc2/episode_score', float(score), step)
                         except Exception:
                             pass
                         try:
                             if length is not None and self.opt_writer is not None:
-                                self.opt_writer.add_scalar('sc2/episode_length', float(length), step)
+                                self._safe_add_scalar('opt', self.opt_writer, 'sc2/episode_length', float(length), step)
                         except Exception:
                             pass
         except Exception:
             pass
 
-        # Also attempt to detect training updates (n_updates) and dump logger scalars
+        # write train/* metrics once per optimizer update
         try:
-            logger = getattr(getattr(self, 'model', None), 'logger', None)
-            if logger is not None:
-                curr_updates = None
-                try:
-                    if hasattr(logger, 'name_to_value') and 'n_updates' in logger.name_to_value:
-                        curr_updates = int(logger.name_to_value.get('n_updates'))
-                except Exception:
-                    curr_updates = None
-                try:
-                    if curr_updates is None and hasattr(logger, 'name_to_value') and 'train/n_updates' in logger.name_to_value:
-                        curr_updates = int(logger.name_to_value.get('train/n_updates'))
-                except Exception:
-                    curr_updates = None
-                try:
-                    if curr_updates is None and hasattr(logger, 'name_to_mean') and 'n_updates' in logger.name_to_mean:
-                        curr_updates = int(logger.name_to_mean.get('n_updates'))
-                except Exception:
-                    curr_updates = None
-                try:
-                    if curr_updates is None and hasattr(logger, 'name_to_mean') and 'train/n_updates' in logger.name_to_mean:
-                        curr_updates = int(logger.name_to_mean.get('train/n_updates'))
-                except Exception:
-                    curr_updates = None
-
-                if curr_updates is not None and curr_updates != self._last_n_updates and self._is_main_process():
-                    # write logger scalars to fundamental timeline using current opt_step
-                    try:
-                        step = int(self.opt_step)
-                        self._dump_logger_scalars(logger, self.env_writer, step)
-                    except Exception:
-                        pass
-                    self._last_n_updates = curr_updates
+            if self._is_main_process():
+                logger = getattr(getattr(self, 'model', None), 'logger', None)
+                n_updates = self._get_logger_n_updates(logger)
+                if n_updates is not None and n_updates != self._last_n_updates:
+                    self._dump_logger_scalars(logger, self.env_writer, int(self.opt_step), writer_name="env")
+                    self._last_n_updates = n_updates
         except Exception:
             pass
         return True
@@ -270,6 +265,26 @@ class TBDualWriterCallback(BaseCallback):
             pass
         return True
 
+    def _get_logger_n_updates(self, logger):
+        try:
+            if logger is None:
+                return None
+            name_to_value = getattr(logger, 'name_to_value', None)
+            if isinstance(name_to_value, dict):
+                if 'train/n_updates' in name_to_value:
+                    return int(name_to_value.get('train/n_updates'))
+                if 'n_updates' in name_to_value:
+                    return int(name_to_value.get('n_updates'))
+            name_to_mean = getattr(logger, 'name_to_mean', None)
+            if isinstance(name_to_mean, dict):
+                if 'train/n_updates' in name_to_mean:
+                    return int(name_to_mean.get('train/n_updates'))
+                if 'n_updates' in name_to_mean:
+                    return int(name_to_mean.get('n_updates'))
+        except Exception:
+            return None
+        return None
+
     def _on_rollout_end(self) -> None:
         # write env-step simple scalar: current num_timesteps
         # env-step writes: only if main process and respecting frequency
@@ -279,23 +294,7 @@ class TBDualWriterCallback(BaseCallback):
             num_ts = int(self.model.num_timesteps)
             # write using optimization-step as x-axis (treat rollout count as primary step)
             if (self.opt_step % self.write_env_every) == 0 and self.env_writer is not None:
-                self.env_writer.add_scalar("training/num_timesteps", num_ts, int(self.opt_step))
-                # Also attempt to capture SB3's logger scalar values (train/*, rollout/*)
-                try:
-                    logger = getattr(self.model, "logger", None)
-                    # Use robust extractor to convert logger values to numeric and
-                    # write them using opt_step as the x-axis.
-                    try:
-                        self._dump_logger_scalars(logger, self.env_writer, int(self.opt_step))
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
-                # attempt to mirror any SB3-written event files found under base_log_dir
-                try:
-                    self._mirror_sb3_tb_to_fundamental()
-                except Exception:
-                    pass
+                self._safe_add_scalar("env", self.env_writer, "training/num_timesteps", num_ts, int(self.opt_step))
         except Exception:
             pass
 
@@ -310,12 +309,12 @@ class TBDualWriterCallback(BaseCallback):
                     # fn-level
                     if "fn_entropy_mean" in stats:
                         try:
-                            self.opt_writer.add_scalar("entropy/fn", float(stats["fn_entropy_mean"]), step)
+                            self._safe_add_scalar("opt", self.opt_writer, "entropy/fn", float(stats["fn_entropy_mean"]), step)
                         except Exception:
                             pass
                     if "fn_logprob_mean" in stats:
                         try:
-                            self.opt_writer.add_scalar("log_prob/fn", float(stats["fn_logprob_mean"]), step)
+                            self._safe_add_scalar("opt", self.opt_writer, "log_prob/fn", float(stats["fn_logprob_mean"]), step)
                         except Exception:
                             pass
                     # per-slot
@@ -339,7 +338,7 @@ class TBDualWriterCallback(BaseCallback):
                         except Exception:
                             name = f"slot_{i:02d}"
                         try:
-                            self.opt_writer.add_scalar(f"used/arg/{name}", float(used), step)
+                            self._safe_add_scalar("opt", self.opt_writer, f"used/arg/{name}", float(used), step)
                         except Exception:
                             pass
 
@@ -353,7 +352,7 @@ class TBDualWriterCallback(BaseCallback):
                         except Exception:
                             name = f"slot_{i:02d}"
                         try:
-                            self.opt_writer.add_scalar(f"entropy/arg/{name}", float(ent), step)
+                            self._safe_add_scalar("opt", self.opt_writer, f"entropy/arg/{name}", float(ent), step)
                         except Exception:
                             pass
 
@@ -367,7 +366,7 @@ class TBDualWriterCallback(BaseCallback):
                         except Exception:
                             name = f"slot_{i:02d}"
                         try:
-                            self.opt_writer.add_scalar(f"log_prob/arg/{name}", float(lp), step)
+                            self._safe_add_scalar("opt", self.opt_writer, f"log_prob/arg/{name}", float(lp), step)
                         except Exception:
                             pass
 

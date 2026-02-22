@@ -39,7 +39,7 @@ def main():
 
     env_name = require("env")
     import datetime
-    today_str = datetime.datetime.now().strftime("%Y%m%d%H")
+    today_str = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
     # Use user-provided out_dir as base path (required). Timestamped subfolder will be created inside it.
     out_dir_root = require("out_dir")
     base_dir = os.path.join(out_dir_root, today_str)
@@ -54,6 +54,11 @@ def main():
         policy_kwargs["features_extractor_class"] = VectorLayerNormExtractor
     env_kwargs = require("env_kwargs")
     os.makedirs(out_dir, exist_ok=True)
+    # expose output dir to worker envs before envs are created
+    try:
+        os.environ['TRAIN_OUT_DIR'] = base_dir
+    except Exception:
+        pass
     ppo_param_keys = [
         "learning_rate", "ent_coef", "batch_size", "n_epochs", "gamma", "gae_lambda", "n_steps", "clip_range", "vf_coef", "max_grad_norm"
     ]
@@ -87,11 +92,6 @@ def main():
     env_fn = make_env_fn(env_name, env_kwargs)
     vec_env = make_vec_env(env_fn, n_envs=n_envs, seed=seed, wrapper_class=Monitor)
     tb_log = os.path.join(base_dir, tb_log_dirname) if tensorboard else None
-    # expose output dir to worker envs so they can write verification snapshots there
-    try:
-        os.environ['TRAIN_OUT_DIR'] = base_dir
-    except Exception:
-        pass
     log_dir = os.path.join(base_dir, "logs")
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, "train.log")

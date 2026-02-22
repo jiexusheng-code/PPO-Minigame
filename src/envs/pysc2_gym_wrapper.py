@@ -114,10 +114,9 @@ class PySC2GymEnv(gym.Env):
                 }
                 out_dir = os.environ.get('TRAIN_OUT_DIR', None)
                 if out_dir is None:
-                    path = os.path.join(os.getcwd(), 'param_semantics_env.json')
-                else:
-                    os.makedirs(out_dir, exist_ok=True)
-                    path = os.path.join(out_dir, 'param_semantics_env.json')
+                    out_dir = os.path.join(os.getcwd(), 'models')
+                os.makedirs(out_dir, exist_ok=True)
+                path = os.path.join(out_dir, 'param_semantics_env.json')
                 with open(path, 'w', encoding='utf-8') as f:
                     json.dump(snapshot, f, ensure_ascii=False, indent=2)
                 self.logger.info(f"Wrote param semantics snapshot to {path}")
