@@ -31,6 +31,8 @@ class PySC2GymEnv(gym.Env):
         self.visualize = visualize
         self.reset_jitter_max_steps = max(0, int(reset_jitter_max_steps))
         self._step_count = 0  # 记录步数
+        # whether we've already applied the one-time initial jitter
+        self._init_jitter_done = False
 
         # 日志设置：只用主进程的logging.basicConfig，所有模块共用同一日志文件
         self.logger = logging.getLogger("PySC2GymEnv")
@@ -208,8 +210,8 @@ class PySC2GymEnv(gym.Env):
         timesteps = self._env.reset()
         self.timestep = timesteps[0]
 
-        # Optional reset jitter: execute random no-op steps to desynchronize parallel env episode boundaries.
-        if self.reset_jitter_max_steps > 0:
+        # Optional one-time initial jitter: execute random no-op steps only on first reset
+        if self.reset_jitter_max_steps > 0 and not getattr(self, '_init_jitter_done', False):
             try:
                 if hasattr(self, "np_random") and self.np_random is not None:
                     jitter_steps = int(self.np_random.integers(0, self.reset_jitter_max_steps + 1))
@@ -228,6 +230,11 @@ class PySC2GymEnv(gym.Env):
                         self.timestep = timesteps[0]
                 except Exception:
                     break
+            # ensure we don't repeat initial jitter on subsequent resets
+            try:
+                self._init_jitter_done = True
+            except Exception:
+                pass
 
         obs_dict = self._obs_to_space(self.timestep)
         info = {}

@@ -61,8 +61,8 @@ eval_deterministic: false  # 评估使用确定性策略（True）还是采样�
 eval_render: false         # 在评估时是否打开渲染（通常设为 false，在离线训练环境中禁用以节省资源）。
 
 # ----------------- TensorBoard / 日志 -----------------
-tensorboard: true          # 是否启用 TensorBoard 日志。启用后会在 outputs 下创建 tb_logs/fundamental 与 tb_logs/extra 两个子目录。
-tb_log_dir: tb_logs        # TB 日志的顶级子目录名（相对于 out_dir），train.py 会在该目录下创建 `fundamental`（主要标量）和 `extra`（优化级别指标）。
+tensorboard: true          # 是否启用 TensorBoard 日志。启用后会在输出目录下创建 SB3 的默认 TB 子目录（例如 PPO_*）以及本回调写入的 `extra` 子目录。
+tb_log_dir: tb_logs        # TB 日志的顶级子目录名（相对于 out_dir），train.py 会在该目录下创建子目录用于 SB3 默认输出与本项目扩展的 `extra`。
 log_interval: 1            # 控制台/日志输出频率（传给 model.learn(..., log_interval)）。单位为 optimization-step（多少次 rollout/update 打印一次）。
                             # 建议：训练过程实时监控设为 1，长期训练可调大以减少输出。
 

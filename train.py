@@ -136,7 +136,7 @@ def main():
     # being created; our TBDualWriterCallback appends a custom
     # output_format to the SB3 logger to capture SB3's writekvs output
     # and mirror default metrics into `fundamental` using optimization-step.
-    tb_log_for_sb3 = None
+    tb_log_for_sb3 = tb_log
     if checkpoint_path and os.path.isfile(checkpoint_path):
         logger.info(f"[INFO] 从checkpoint加载模型: {checkpoint_path}")
         model = PPO.load(checkpoint_path, env=vec_env, tensorboard_log=tb_log_for_sb3, policy=policy, policy_kwargs=policy_kwargs, device=device, **ppo_kwargs)
