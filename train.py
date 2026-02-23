@@ -132,10 +132,11 @@ def main():
             checkpoint_path = None
     else:
         checkpoint_path = None
-    # Allow SB3 to write its internal TensorBoard event files into the same
-    # tb directory so we can mirror any SB3-default scalars into our
-    # `fundamental` writer; keep disabled when tensorboard is False.
-    tb_log_for_sb3 = tb_log if tensorboard and tb_log else None
+    # Disable SB3 internal TensorBoard writer to avoid PPO_* subfolders
+    # being created; our TBDualWriterCallback appends a custom
+    # output_format to the SB3 logger to capture SB3's writekvs output
+    # and mirror default metrics into `fundamental` using optimization-step.
+    tb_log_for_sb3 = None
     if checkpoint_path and os.path.isfile(checkpoint_path):
         logger.info(f"[INFO] 从checkpoint加载模型: {checkpoint_path}")
         model = PPO.load(checkpoint_path, env=vec_env, tensorboard_log=tb_log_for_sb3, policy=policy, policy_kwargs=policy_kwargs, device=device, **ppo_kwargs)
@@ -160,6 +161,25 @@ def main():
             self._logger = logger or logging.getLogger("train")
             self._save_best_only = bool(save_best_only)
             self._checkpoint_dir = checkpoint_dir
+
+        def _on_training_start(self) -> None:
+            # run one immediate evaluation at training start to ensure eval metrics
+            # are available early (useful for short smoke-runs)
+            try:
+                super()._on_training_start()
+            except Exception:
+                pass
+            try:
+                # call EvalCallback's evaluation routine directly once
+                self._logger.info(f"[EvalCallback] 初始评估触发: eval_freq={self.eval_freq}")
+                try:
+                    # this will call the internal evaluation logic and populate
+                    # `last_mean_reward` / `evaluations_length` etc.
+                    self._on_step()
+                except Exception:
+                    pass
+            except Exception:
+                pass
 
         def _on_step(self) -> bool:
             do_eval = self.eval_freq > 0 and self.n_calls % self.eval_freq == 0
