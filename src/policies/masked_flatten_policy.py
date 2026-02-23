@@ -23,22 +23,14 @@ class VectorLayerNormExtractor(BaseFeaturesExtractor):
     def __init__(self, observation_space, cnn_output_dim: int = 256):
         spaces = getattr(observation_space, "spaces", {})
 
+        # Align with pysc2-rl-agents preprocessing: use full screen/minimap feature sets
         self._screen_layers = [
-            (features.ScreenFeatures.visibility_map, "visibility_map"),
-            (features.ScreenFeatures.player_relative, "player_relative"),
-            (features.ScreenFeatures.unit_type, "unit_type"),
-            (features.ScreenFeatures.selected, "selected"),
-            (features.ScreenFeatures.unit_hit_points_ratio, "unit_hit_points_ratio"),
-            (features.ScreenFeatures.build_progress, "build_progress"),
-            (features.ScreenFeatures.buildable, "buildable"),
+            (i, getattr(features.SCREEN_FEATURES[i], "name", f"screen_{i}"))
+            for i in range(len(features.SCREEN_FEATURES))
         ]
         self._minimap_layers = [
-            (features.MinimapFeatures.visibility_map, "visibility_map"),
-            (features.MinimapFeatures.player_relative, "player_relative"),
-            (features.MinimapFeatures.selected, "selected"),
-            (features.MinimapFeatures.unit_type, "unit_type"),
-            (features.MinimapFeatures.alerts, "alerts"),
-            (features.MinimapFeatures.buildable, "buildable"),
+            (i, getattr(features.MINIMAP_FEATURES[i], "name", f"minimap_{i}"))
+            for i in range(len(features.MINIMAP_FEATURES))
         ]
 
         self._screen_cat_info, self._screen_cont_idx, self._screen_in_channels = self._build_layer_info(

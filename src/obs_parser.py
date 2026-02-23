@@ -122,19 +122,15 @@ class ObsParser:
         self.screen_size = screen_size if screen_size is not None else self.config.screen_size
         self.minimap_size = minimap_size if minimap_size is not None else self.config.minimap_size
         
-        # 向量使用规范长度（canonical），便于跨地图复用与有效性掩码
-        # 默认采用 SC2 player 向量中的 11 个字段作为规范长度
-        # 优先使用配置中声明的 canonical_vector_size
-        self.vector_size = getattr(self.config, "canonical_vector_size", None)
-        if self.vector_size is None:
-            self.vector_size = sum(field["size"] for field in self.config.vector_fields.values())
+        # 对齐 pysc2-rl-agents: flat 向量直接使用 obs['player'] 的 11 维
+        self.vector_size = 11
         
         # 可用动作的维度（所有可能的 PYSC2 函数）
         self.num_actions = len(actions.FUNCTIONS)
         
-        # 屏幕和小地图的通道数
-        self.screen_channels = len(self.config.screen_layers)
-        self.minimap_channels = len(self.config.minimap_layers)
+        # 对齐 pysc2-rl-agents: 使用完整特征层通道
+        self.screen_channels = len(features.SCREEN_FEATURES)
+        self.minimap_channels = len(features.MINIMAP_FEATURES)
     
     def get_output_spec(self) -> Dict[str, Any]:
         """
@@ -147,82 +143,45 @@ class ObsParser:
             "vector": {
                 "shape": (self.vector_size,),
                 "dtype": np.float32,
-                "desc": "结构化向量特征（player信息等）"
+                "desc": "player 向量（与 pysc2-rl-agents flat 输入一致）"
             },
             "screen": {
                 "shape": (self.screen_size, self.screen_size, self.screen_channels),
                 "dtype": np.float32,
-                "desc": f"屏幕特征层：{[name for _, name in self.config.screen_layers]}"
+                "desc": "完整 screen 特征层（H, W, C）"
             },
             "minimap": {
                 "shape": (self.minimap_size, self.minimap_size, self.minimap_channels),
                 "dtype": np.float32,
-                "desc": f"小地图特征层：{[name for _, name in self.config.minimap_layers]}"
+                "desc": "完整 minimap 特征层（H, W, C）"
             },
             "available_actions": {
                 "shape": (self.num_actions,),
                 "dtype": np.float32,
                 "desc": "可用动作 one-hot 向量"
             },
-            "screen_layer_flags": {
-                "shape": (self.screen_channels,),
-                "dtype": np.float32,
-                "desc": "每个 canonical screen 层的 0/1 标志（顺序与 config.screen_layers 一致）"
-            },
-            "minimap_layer_flags": {
-                "shape": (self.minimap_channels,),
-                "dtype": np.float32,
-                "desc": "每个 canonical minimap 层的 0/1 标志（顺序与 config.minimap_layers 一致）"
-            },
-            "vector_mask": {
-                "shape": (self.vector_size,),
-                "dtype": np.float32,
-                "desc": "结构化向量每一维的 0/1 有效性标志（与 vector 对齐）"
-            },
         }
     
     def parse(self, obs: Dict) -> Dict[str, np.ndarray]:
-        """Parse a single observation and return inputs with explicit masks."""
-        # 提取向量特征（不在 parser 内门控，mask 单独输出）
-        vector, vector_mask = self._extract_vector(obs)
+        """Parse a single observation, aligned with pysc2-rl-agents preprocessor."""
+        # 对齐 pysc2-rl-agents: vector 使用 player 向量
+        vector = self._extract_vector(obs)
 
-        # 提取空间特征（不在 parser 内门控，mask 单独输出）
+        # 对齐 pysc2-rl-agents: screen/minimap 使用完整 feature map
         screen = self._extract_screen(obs)
         minimap = self._extract_minimap(obs)
 
         # 提取可用动作
         available_actions = self._extract_available_actions(obs)
 
-        # 每层激活标志（独立输出，由模型侧做门控）
-        active_set = self.config.screen_active_layers
-        if active_set is None:
-            screen_layer_flags = np.ones(self.screen_channels, dtype=np.float32)
-        else:
-            screen_layer_flags = np.array([
-                1.0 if name in active_set else 0.0
-                for _, name in self.config.screen_layers
-            ], dtype=np.float32)
-
-        minimap_active_set = self.config.minimap_active_layers
-        if minimap_active_set is None:
-            minimap_layer_flags = np.ones(self.minimap_channels, dtype=np.float32)
-        else:
-            minimap_layer_flags = np.array([
-                1.0 if name in minimap_active_set else 0.0
-                for _, name in self.config.minimap_layers
-            ], dtype=np.float32)
-
         return {
             "vector": vector,
             "screen": screen,
             "minimap": minimap,
             "available_actions": available_actions,
-            "screen_layer_flags": screen_layer_flags,
-            "minimap_layer_flags": minimap_layer_flags,
-            "vector_mask": vector_mask,
         }
     
-    def _extract_vector(self, obs: Dict) -> tuple:
+    def _extract_vector(self, obs: Dict) -> np.ndarray:
         """
         提取结构化向量特征
         
@@ -232,244 +191,37 @@ class ObsParser:
                 但保留是为了代码的通用性）
           处理：逐维归一化到 [0, 1]
         """
-        # 输出为选取字段的拼接向量（长度 = sum sizes），并返回对应的有效性掩码
-        vec_list = []
-        mask_list = []
+        # 对齐 pysc2-rl-agents: flat = obs['player']（11维）
+        if "player" not in obs:
+            return np.zeros(self.vector_size, dtype=np.float32)
 
-        if "player_vec" in self.config.vector_fields:
-            field_cfg = self.config.vector_fields["player_vec"]
-            indices = field_cfg["indices"]
-            player_vals = obs["player"][indices].astype(np.float32)
-
-            if field_cfg.get("normalize", False):
-                player_vals = np.log1p(player_vals)
-
-            # 门控：仅支持与 indices 等长的布尔列表/数组（每维单独有效/无效）
-            if "valid" not in field_cfg:
-                raise RuntimeError("vector field 'player_vec' must provide 'valid' as a boolean list/array matching indices length")
-
-            valid_cfg = field_cfg["valid"]
-            valid_mask = np.asarray(valid_cfg, dtype=np.bool_)
-            if valid_mask.shape[0] != len(indices):
-                raise RuntimeError(f"'valid' length {valid_mask.shape[0]} doesn't match indices length {len(indices)} for player_vec")
-
-            vec_list.append(player_vals)
-            mask_list.append(valid_mask.astype(np.float32))
-
-        if len(vec_list) == 0:
-            vector = np.zeros(self.vector_size, dtype=np.float32)
-            vector_mask = np.zeros(self.vector_size, dtype=np.float32)
-        else:
-            vector = np.concatenate(vec_list, axis=0).astype(np.float32)
-            vector_mask = np.concatenate(mask_list, axis=0).astype(np.float32)
-
-        # 如果长度不够，补零
-        if len(vector) < self.vector_size:
-            pad_len = self.vector_size - len(vector)
-            vector = np.pad(vector, (0, pad_len), mode='constant', constant_values=0)
-            vector_mask = np.pad(vector_mask, (0, pad_len), mode='constant', constant_values=0)
-
-        return vector, vector_mask
+        vector = np.asarray(obs["player"], dtype=np.float32).reshape(-1)
+        if vector.shape[0] > self.vector_size:
+            vector = vector[: self.vector_size]
+        elif vector.shape[0] < self.vector_size:
+            vector = np.pad(vector, (0, self.vector_size - vector.shape[0]), mode='constant', constant_values=0)
+        return vector.astype(np.float32)
     
     def _extract_screen(self, obs: Dict) -> np.ndarray:
-        """
-        提取屏幕特征层
-
-        处理流程：
-        1. 每层分别提取并 reshape 到 (H, W, 1)
-        2. 对 SCALAR 层按 scale 归一化到 [0,1]；对 CATEGORICAL 层保留标签值
-        3. 拼接成 (H, W, C) 并缩放到目标尺寸
-        """
-        layers = []
-        import re
-        from scipy import ndimage
-
-        def _get_layer_index(layer_feature):
-            if hasattr(layer_feature, "index"):
-                return layer_feature.index
-            try:
-                return int(layer_feature)
-            except Exception:
-                s = str(layer_feature)
-                m = re.search(r"(\d+)", s)
-                if m:
-                    return int(m.group(1))
-                raise RuntimeError(f"无法解析 screen layer feature: {layer_feature}")
-
-        # (no debug prints)
-
-        for layer_feature, _name in self.config.screen_layers:
-            li = _get_layer_index(layer_feature)
-
-            # 如果 obs 中没有 feature_screen，直接报错
-            if "feature_screen" not in obs or obs.get("feature_screen") is None:
-                raise RuntimeError("observation missing 'feature_screen' while screen layers are requested")
-
-            fs = obs["feature_screen"]
-            if li < 0 or li >= fs.shape[0]:
-                raise RuntimeError(f"screen layer index {li} out of range for feature_screen with shape {fs.shape}")
-            layer_data = fs[li]
-
-            # 识别该层是 SCALAR 还是 CATEGORICAL（尽量使用 pysc2 的元信息）
-            f_type = None
-            try:
-                meta = features.SCREEN_FEATURES[li]
-                f_type = getattr(meta, "type", None)
-            except Exception:
-                f_type = getattr(layer_feature, "type", None)
-
-            is_categorical = False
-            if f_type is not None:
-                try:
-                    name = str(f_type).upper()
-                    if "CAT" in name:
-                        is_categorical = True
-                except Exception:
-                    is_categorical = False
-
-            # 处理数据
-            if is_categorical:
-                # CATEGORICAL: 保留原始标签值，建议在模型侧用 embedding/one-hot 处理
-                cdata = layer_data.astype(np.float32)
-            else:
-                # SCALAR: 按 scale 归一化到 [0,1]
-                scale = None
-                try:
-                    meta = features.SCREEN_FEATURES[li]
-                    scale = getattr(meta, "scale", None)
-                except Exception:
-                    scale = None
-
-                cdata = layer_data.astype(np.float32)
-                if scale is not None and scale > 1:
-                    cdata = cdata / float(scale - 1)
-
-            # 注意：不在 parser 内置零，保留原始层值；mask 由 screen_layer_flags 提供
-
-            # 添加通道维度
-            cdata = np.expand_dims(cdata, axis=-1)
-            # 如果需要，将每一层按类型单独 resize：categorical -> nearest (order=0)，scalar -> bilinear (order=1)
-            try:
-                h, w = cdata.shape[0], cdata.shape[1]
-                if h != self.screen_size or w != self.screen_size:
-                    order = 0 if is_categorical else 1
-                    zoom_factors = (self.screen_size / float(h), self.screen_size / float(w))
-                    resized = ndimage.zoom(cdata[:, :, 0], zoom_factors, order=order)
-                    # crop or pad to exact target size
-                    if resized.shape[0] > self.screen_size or resized.shape[1] > self.screen_size:
-                        resized = resized[: self.screen_size, : self.screen_size]
-                    elif resized.shape[0] < self.screen_size or resized.shape[1] < self.screen_size:
-                        pad_h = self.screen_size - resized.shape[0]
-                        pad_w = self.screen_size - resized.shape[1]
-                        resized = np.pad(resized, ((0, pad_h), (0, pad_w)), mode='constant', constant_values=0)
-                    cdata = np.expand_dims(resized, axis=-1)
-            except Exception:
-                # fallback: keep original cdata
-                pass
-
-            layers.append(cdata)
-
-        # 拼接所有层（若空则返回全零占位）
-        if len(layers) == 0:
-            screen = np.zeros((self.screen_size, self.screen_size, self.screen_channels), dtype=np.float32)
-        else:
-            screen = np.concatenate(layers, axis=-1)  # (H, W, C)
-
-        # 最终合并后尺寸应已为目标尺寸（若输入层已对齐）。若仍不匹配，依然使用统一缩放作为后备。
-        screen = self._resize_spatial(screen, self.screen_size)
-
+        # 对齐 pysc2-rl-agents: screen = transpose(feature_screen, [1,2,0])
+        fs = obs.get("feature_screen", None)
+        if fs is None:
+            return np.zeros((self.screen_size, self.screen_size, self.screen_channels), dtype=np.float32)
+        screen = np.transpose(np.asarray(fs, dtype=np.float32), [1, 2, 0])
+        if screen.shape[0] != self.screen_size or screen.shape[1] != self.screen_size:
+            screen = self._resize_spatial(screen, self.screen_size)
         return screen.astype(np.float32)
 
     # parser no longer exposes per-layer masks; gating is applied inside _extract_screen
     
     def _extract_minimap(self, obs: Dict) -> np.ndarray:
-        """
-        提取小地图特征层（与屏幕处理逻辑类似）
-        """
-        layers = []
-        import re
-        from scipy import ndimage
-
-        # (no debug prints)
-
-        def _get_layer_index(layer_feature):
-            if hasattr(layer_feature, "index"):
-                return layer_feature.index
-            try:
-                return int(layer_feature)
-            except Exception:
-                s = str(layer_feature)
-                m = re.search(r"(\d+)", s)
-                if m:
-                    return int(m.group(1))
-                raise RuntimeError(f"无法解析 minimap layer feature: {layer_feature}")
-
-        for layer_feature, _name in self.config.minimap_layers:
-            li = _get_layer_index(layer_feature)
-
-            if "feature_minimap" not in obs or obs.get("feature_minimap") is None:
-                raise RuntimeError("observation missing 'feature_minimap' while minimap layers are requested")
-
-            mm = obs["feature_minimap"]
-            if li < 0 or li >= mm.shape[0]:
-                raise RuntimeError(f"minimap layer index {li} out of range for feature_minimap with shape {mm.shape}")
-            layer_data = mm[li]
-
-            # 判断类型
-            f_type = None
-            try:
-                meta = features.MINIMAP_FEATURES[li]
-                f_type = getattr(meta, "type", None)
-            except Exception:
-                f_type = getattr(layer_feature, "type", None)
-
-            is_categorical = False
-            if f_type is not None:
-                try:
-                    name = str(f_type).upper()
-                    if "CAT" in name:
-                        is_categorical = True
-                except Exception:
-                    is_categorical = False
-
-            if is_categorical:
-                cdata = layer_data.astype(np.float32)
-            else:
-                scale = None
-                try:
-                    meta = features.MINIMAP_FEATURES[li]
-                    scale = getattr(meta, "scale", None)
-                except Exception:
-                    scale = None
-
-                cdata = layer_data.astype(np.float32)
-                if scale is not None and scale > 1:
-                    cdata = cdata / float(scale - 1)
-
-            cdata = np.expand_dims(cdata, axis=-1)
-            try:
-                h, w = cdata.shape[0], cdata.shape[1]
-                if h != self.minimap_size or w != self.minimap_size:
-                    order = 0 if is_categorical else 1
-                    zoom_factors = (self.minimap_size / float(h), self.minimap_size / float(w))
-                    resized = ndimage.zoom(cdata[:, :, 0], zoom_factors, order=order)
-                    if resized.shape[0] > self.minimap_size or resized.shape[1] > self.minimap_size:
-                        resized = resized[: self.minimap_size, : self.minimap_size]
-                    elif resized.shape[0] < self.minimap_size or resized.shape[1] < self.minimap_size:
-                        pad_h = self.minimap_size - resized.shape[0]
-                        pad_w = self.minimap_size - resized.shape[1]
-                        resized = np.pad(resized, ((0, pad_h), (0, pad_w)), mode='constant', constant_values=0)
-                    cdata = np.expand_dims(resized, axis=-1)
-            except Exception:
-                pass
-            layers.append(cdata)
-
-        if len(layers) == 0:
-            minimap = np.zeros((self.minimap_size, self.minimap_size, self.minimap_channels), dtype=np.float32)
-        else:
-            minimap = np.concatenate(layers, axis=-1)
-
-        minimap = self._resize_spatial(minimap, self.minimap_size)
+        # 对齐 pysc2-rl-agents: minimap = transpose(feature_minimap, [1,2,0])
+        mm = obs.get("feature_minimap", None)
+        if mm is None:
+            return np.zeros((self.minimap_size, self.minimap_size, self.minimap_channels), dtype=np.float32)
+        minimap = np.transpose(np.asarray(mm, dtype=np.float32), [1, 2, 0])
+        if minimap.shape[0] != self.minimap_size or minimap.shape[1] != self.minimap_size:
+            minimap = self._resize_spatial(minimap, self.minimap_size)
         return minimap.astype(np.float32)
     
     def _extract_available_actions(self, obs: Dict) -> np.ndarray:
@@ -557,8 +309,6 @@ def parse_observations(obs_list: List[Dict], parser: ObsParser) -> Dict[str, np.
             "screen": (B, H, W, C),
             "minimap": (B, H, W, C),
             "available_actions": (B, num_actions),
-            "minimap_layer_flags": (B, minimap_channels),
-            "vector_mask": (B, vector_size),
         }
     """
     batch = {
@@ -566,9 +316,6 @@ def parse_observations(obs_list: List[Dict], parser: ObsParser) -> Dict[str, np.
         "screen": [],
         "minimap": [],
         "available_actions": [],
-        "screen_layer_flags": [],
-        "minimap_layer_flags": [],
-        "vector_mask": [],
     }
     
     for obs in obs_list:
