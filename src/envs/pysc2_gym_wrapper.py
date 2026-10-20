@@ -21,15 +21,20 @@ class PySC2GymEnv(gym.Env):
         step_mul: int = 8,
         visualize: bool = False,
         reset_jitter_max_steps: int = 0,
+        random_seed: Optional[int] = None,
     ):
         import logging, os, datetime
         super().__init__()
         self.map_name = map_name
         self.screen_size = screen_size
-        self.minimap_size = minimap_size 
+        self.minimap_size = minimap_size
         self.step_mul = step_mul
         self.visualize = visualize
         self.reset_jitter_max_steps = max(0, int(reset_jitter_max_steps))
+        # Seed used to construct SC2Env. train.py passes seed+rank per env;
+        # reset(seed=...) remains authoritative if it differs.
+        self.random_seed = None if random_seed is None else int(random_seed)
+        self._sc2_random_seed = self.random_seed
         self._step_count = 0  # 记录步数
         # whether we've already applied the one-time initial jitter
         self._init_jitter_done = False
@@ -149,6 +154,7 @@ class PySC2GymEnv(gym.Env):
             visualize=self.visualize,
             ensure_available_actions=True,
             score_index=0,
+            random_seed=self._sc2_random_seed,
         )
 
     def _build_observation_space_from_parser(self, parsed: Dict[str, object]):
@@ -203,23 +209,40 @@ class PySC2GymEnv(gym.Env):
         _add("vector_mask", parsed.get("vector_mask"), np.float32)
         return out
 
+    def _apply_sc2_seed(self, seed: Optional[int]) -> None:
+        """Rebuild SC2Env if reset(seed) disagrees with the construction seed.
+
+        The constructor probe reset (used to build the spaces) must not make
+        the later Gymnasium seed ineffective. When train.py already passes the
+        same per-env seed at construction this is a no-op and no extra SC2
+        launch occurs.
+        """
+        if seed is None or int(seed) == self._sc2_random_seed:
+            return
+        self.logger.info(
+            f"reset(seed={seed}) 与构造 seed={self._sc2_random_seed} 不同，重建 SC2Env"
+        )
+        if self._env is not None:
+            try:
+                self._env.close()
+            except Exception:
+                pass
+            self._env = None
+        self._sc2_random_seed = int(seed)
+        self._lazy_init()
+
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
-        if seed is not None:
-            np.random.seed(seed)
+        # Gymnasium seeding: initializes self.np_random without touching the
+        # process-global numpy RNG.
+        super().reset(seed=seed)
+        self._apply_sc2_seed(seed)
         self._lazy_init()
         timesteps = self._env.reset()
         self.timestep = timesteps[0]
 
         # Optional one-time initial jitter: execute random no-op steps only on first reset
         if self.reset_jitter_max_steps > 0 and not getattr(self, '_init_jitter_done', False):
-            try:
-                if hasattr(self, "np_random") and self.np_random is not None:
-                    jitter_steps = int(self.np_random.integers(0, self.reset_jitter_max_steps + 1))
-                else:
-                    jitter_steps = int(np.random.randint(0, self.reset_jitter_max_steps + 1))
-            except Exception:
-                jitter_steps = 0
-
+            jitter_steps = int(self.np_random.integers(0, self.reset_jitter_max_steps + 1))
             for _ in range(jitter_steps):
                 try:
                     no_op = self.actions.FUNCTIONS.no_op()
@@ -292,6 +315,26 @@ class PySC2GymEnv(gym.Env):
             self.logger.error(f"[参数异常] {e}, fn_id={fn_id}, param_vec={param_vec}, 使用 no_op 回退")
             return [], True
 
+    def _step_with_no_op(self, reason: str, fn_id, args) -> tuple:
+        """Execute ``no_op`` as the safe fallback.
+
+        Returns ``(timesteps, executed_fn_id, executed_args)``. If even the
+        no_op cannot be executed, raise a clear ``RuntimeError`` instead of
+        swallowing the failure and leaving the environment out of sync.
+        """
+        self.logger.error(
+            f"[执行动作回退] {reason}, fn_id={fn_id}, args={args}, 使用 no_op"
+        )
+        try:
+            no_op = self.actions.FUNCTIONS.no_op()
+            timesteps = self._env.step([no_op])
+            return timesteps, self.actions.FUNCTIONS.no_op.id, []
+        except Exception as exc:
+            raise RuntimeError(
+                f"动作执行失败且 no_op 回退也失败: fn_id={fn_id}, args={args}, "
+                f"原因={reason}; no_op 错误: {type(exc).__name__}: {exc}"
+            ) from exc
+
     def step(self, action) -> tuple:
         assert self._env is not None, "Env not initialized; call reset first"
 
@@ -308,27 +351,51 @@ class PySC2GymEnv(gym.Env):
 
         args, clipped = self._sanitize_params(fn_id, raw_params)
 
-        try:
-            act = self.actions.FUNCTIONS[fn_id](*args) if args else self.actions.FUNCTIONS[fn_id]()
-            exec_fn_id = fn_id
-            exec_args = args
-        except Exception as e:
-            act = self.actions.FUNCTIONS.no_op()
+        # Build and execute inside the safety net: PySC2 validates the argument
+        # count only in SC2Env.step(), so a bad FunctionCall must never escape
+        # before the no_op fallback gets a chance to run.
+        act = None
+        reason = None
+        if clipped:
+            reason = "参数清洗失败"
+        elif fn_id is None or fn_id not in available:
             clipped = True
-            exec_fn_id = self.actions.FUNCTIONS.no_op.id
-            exec_args = []
-            self.logger.error(f"[执行动作异常] {e}, fn_id={fn_id}, args={args}, 使用 no_op 回退")
+            reason = "fn_id 不在 available_actions 中"
+        else:
+            try:
+                act = self.actions.FUNCTIONS[fn_id](*args) if args else self.actions.FUNCTIONS[fn_id]()
+                exec_fn_id = fn_id
+                exec_args = args
+            except Exception as exc:
+                clipped = True
+                reason = f"构造动作异常: {type(exc).__name__}: {exc}"
 
-        timesteps = self._env.step([act])
+        if act is None:
+            timesteps, exec_fn_id, exec_args = self._step_with_no_op(reason, fn_id, args)
+        else:
+            try:
+                timesteps = self._env.step([act])
+            except Exception as exc:
+                clipped = True
+                timesteps, exec_fn_id, exec_args = self._step_with_no_op(
+                    f"底层 step 异常: {type(exc).__name__}: {exc}", fn_id, args
+                )
+
         self.timestep = timesteps[0]  # 更新当前timestep
         self._step_count += 1
 
         obs = self._obs_to_space(self.timestep)
         reward = float(self.timestep.reward)
         terminated = bool(self.timestep.last())
+        # game_steps_per_episode=0: episodes end via timestep.last() only, so
+        # there is no Gymnasium time-limit truncation to report.
         truncated = False
-        info = {"arg_clipped": clipped, "fn_available": fn_id in available}
-        
+        info = {
+            "arg_clipped": clipped,
+            "fn_available": fn_id in available,
+            "executed_fn_id": exec_fn_id,
+        }
+
         self.logger.debug(f"Step {self._step_count}")
         self.logger.debug(f"  Agent raw action: fn_id={fn_id}, raw_params={raw_params}")
         self.logger.debug(f"  Executed action: fn_id={exec_fn_id}, args={exec_args}")

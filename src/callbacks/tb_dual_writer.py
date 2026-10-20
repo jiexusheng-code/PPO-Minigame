@@ -6,14 +6,14 @@ from torch.utils.tensorboard import SummaryWriter
 
 
 class TBDualWriterCallback(BaseCallback):
-    """Write TensorBoard scalars into two separate subdirectories:
-    - fundamental: x axis = optimization/update step counter (opt_step)
-    - extra: x axis = optimization/update step counter (opt_step)
+    """Write project-specific TensorBoard scalars under the ``extra`` directory.
 
-    NOTE: All scalars (except the episode-level reward plot which remains on episode x-axis)
-    are written with the optimization-step as the x-axis. The callback reads
-    `policy._last_per_arg_stats` (if available) to write per-arg metrics.
-    Supports write-frequency control and attempts to ensure only a main/root process writes.
+    SB3 owns the default scalar writer under the configured log directory. This
+    callback reads `policy._last_per_arg_stats` (if available) to write per-arg
+    metrics and uses the optimization step as the x-axis for update metrics.
+    Episode-level reward and length remain on an episode counter.
+    Supports write-frequency control and attempts to ensure only a main/root
+    process writes.
     """
 
     def __init__(self, base_log_dir: str, write_env_every: int = 1, write_opt_every: int = 1, save_every: int = 0, save_dir: str = None, verbose: int = 0):
@@ -277,11 +277,7 @@ class TBDualWriterCallback(BaseCallback):
         self.opt_step += 1
 
     def _mirror_sb3_tb_to_fundamental(self) -> None:
-        """Scan for SB3 TensorBoard event files under the base log dir (excluding our own
-        fundamental/extra dirs) and mirror any new scalar values into the `fundamental`
-        SummaryWriter using the current `opt_step` as x-axis. Files already processed are
-        tracked in `self._processed_sb3_files` to avoid duplicate writes.
-        """
+        """Retained as a compatibility hook; SB3 scalars are not mirrored here."""
         # function intentionally removed: this callback no longer mirrors SB3 event files
         return
 

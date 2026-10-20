@@ -1,0 +1,52 @@
+# Bitahub 首次云端训练配置：有限步数、保守资源。
+# 用法: TRAIN_CONFIG_PATH=configs/bitahub_first_run.yaml python train.py
+# 启动前: python tools/bitahub_preflight.py --config configs/bitahub_first_run.yaml
+
+env: MoveToBeacon
+out_dir: ./models/bitahub_first_run
+checkpoint_path:
+
+n_envs: 8
+seed: 0
+device: auto             # CUDA 可用时使用 GPU，否则回退 CPU；也可写 cpu / cuda / cuda:0
+
+policy: MaskedFlattenPolicy
+policy_kwargs:
+  features_extractor_kwargs:
+    cnn_output_dim: 256
+
+env_kwargs:
+  screen_size: 32
+  minimap_size: 32
+  step_mul: 8
+  visualize: false
+  reset_jitter_max_steps: 15
+
+# 首次云端实验使用有限步数，避免 total_timesteps=-1 无限训练。
+total_timesteps: 1000000
+
+learning_rate: 7e-4
+ent_coef: 0.001
+batch_size: 128          # 等于 n_envs*n_steps，每个 epoch 恰好一个 minibatch
+n_epochs: 4
+gamma: 0.99
+gae_lambda: 0.95
+n_steps: 16
+clip_range: 0.2
+vf_coef: 0.5
+max_grad_norm: 0.5
+clip_value_loss: false
+
+save_iters: 200          # 1M 步约 39 次周期保存
+summary_iters: 10
+eval_every: 50           # 50 opt-steps = 6400 env-steps 评估一次
+n_eval_episodes: 10
+eval_deterministic: false
+eval_render: false
+
+tensorboard: true
+tb_log_dir: tb_logs
+log_interval: 1
+
+save_best_model: true
+verbose: 1

@@ -116,7 +116,7 @@ finally:
 - **shape**：`(N,)`
 - **dtype**：`np.int32`
 - **N 含义**：上一帧执行的动作数量。
-- **含义**：上一帧执行的动作函数 id（非 RAW 模式），具体映射表见action_space.md。
+- **含义**：上一帧执行的动作函数 id（非 RAW 模式），具体映射表见action-space.md。
 
 ### 2.1.9 `map_name`
 - **dtype**：`str`（字符串）
@@ -144,7 +144,7 @@ finally:
 - **维度逐项说明：**
 	- 索引 0：`ability_id`（能力 id，整型）
 		- 含义：表示该队列条目对应的技能/建造/生产能力的协议 id（SC2 ability id）。
-		- 备注：`ability_id` 使用 SC2 协议定义的能力 id 空间，此处只会出现部分ability_id，想要知道其含义可以查看action_space.md。
+		- 备注：`ability_id` 使用 SC2 协议定义的能力 id 空间，此处只会出现部分ability_id，想要知道其含义可以查看action-space.md。
 	- 索引 1：`build_progress`（建造进度，0-100）
 		- 含义：该条目当前的完成百分比（整数，0 表示刚开始，100 表示已完成）。
 
@@ -198,7 +198,7 @@ finally:
 - **shape**：`(N,)`
 - **dtype**：`np.int32`
 - **N 含义**：当前可执行动作函数 id 数量。
-- **含义**：可执行动作函数 id 列表。详见action_space.md。
+- **含义**：可执行动作函数 id 列表。详见action-space.md。
 - **出现条件**：未启用 RAW 动作接口，即 `use_raw_actions=False`。
 
 **对应配置示例：**

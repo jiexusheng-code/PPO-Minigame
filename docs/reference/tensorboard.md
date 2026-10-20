@@ -2,6 +2,15 @@
 
 本文旨在说明记录在tensorboard中的各种指标的含义。
 
+## 日志目录
+
+`<out_dir>/<timestamp>/tb_logs/` 下的实际目录由写入方决定：
+
+- `extra/`：项目回调 `TBDualWriterCallback` 写入的扩展标量（episode score/length、per-arg 指标等）。
+- `PPO_<n>/`（如 `PPO_1/`）：SB3 内置 TensorBoard writer 写入的主指标（`rollout/*`、`eval/*`、`train/*`、`time/*`），编号由 SB3 自动递增。
+
+当前实现没有单独的 `fundamental/` writer，旧文档或历史计划中提到的 `fundamental/` 目录不会再产生。
+
 [TOC]
 
 ## Horizontal axis

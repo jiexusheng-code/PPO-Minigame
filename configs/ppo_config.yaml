@@ -7,6 +7,8 @@ checkpoint_path:
 n_envs: 32                   # 并行环境数量（整数）。含义：同时并行多少个环境进行采样。
                              # 推荐：32（pysc2-rl-agents 默认）。资源允许时可增大，但会线性增加 CPU/内存/显存开销。
 seed: 0                      # 全局随机种子（整数）。用于复现实验。
+device: auto                 # 计算设备：auto（默认，CUDA 可用则用 GPU，否则 CPU）/ cpu / cuda / cuda:0。
+                             # 显式写 cuda 但 CUDA 不可用时会直接报错（避免在 GPU 机器上误用 CPU 长时间训练）。
 
 # ----------------- 策略 / 模型结构 -----------------
 policy: MaskedFlattenPolicy  # 使用的策略类名（字符串或类对象）。项目内默认提供 `MaskedFlattenPolicy`。
@@ -46,7 +48,8 @@ clip_value_loss: false       # 是否对 value loss 使用裁剪（bool），可
 # ----------------- I/O / 监控 与 计数单位说明 -----------------
 # 重要：项目内所有 summary/save/eval 等频率参数统一使用 "optimization-step"（即完整的 rollout + 优化 完成后计为 1）。
 # 转换关系：1 optimization-step = n_envs * n_steps 环境步（environment-steps）。
-# 例如：n_envs=32, n_steps=16 -> 1 opt-step = 512 env-steps。若需要按环境步设置 EvalCallback，请在 train.py 中会自动完成换算（eval_freq = eval_every * n_envs * n_steps）。
+# 例如：n_envs=32, n_steps=16 -> 1 opt-step = 512 env-steps。EvalCallback 按 VecEnv step 计数（每个 VecEnv step 同步推进 n_envs 个环境），
+# 因此 train.py 的换算为 eval_freq = eval_every * n_steps（不要再乘 n_envs）；实际间隔仍为 eval_every 个 optimization-step。
 
 # 模型保存与 summary 控制（单位：optimization-step）
 save_iters: 50              # 模型保存频率（以 optimization-step 为单位）。含义：每隔多少次完整 rollout+优化 保存一次模型。

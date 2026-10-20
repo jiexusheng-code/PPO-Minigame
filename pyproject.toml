@@ -1,0 +1,43 @@
+[project]
+name = "ppo-minigame"
+version = "0.1.0"
+description = "PPO training for StarCraft II mini-games (PySC2 + Stable-Baselines3)"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "numpy==1.26.4",
+    "scipy==1.11.4",
+    "torch>=2.2,<2.3",
+    "stable-baselines3==2.3.0",
+    "gymnasium==0.29.1",
+    "pysc2==3.0.0",
+    "protobuf==3.20.3",
+    "absl-py==1.4.0",
+    "tensorboard==2.19.0",
+    "pyyaml==6.0.1",
+    "opencv-python==4.8.1.78",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3,<9",
+]
+
+# Use the official PyTorch CUDA 12.1 wheel index on desktop Linux/Windows.
+# The CUDA build still runs on CPU when no GPU is available, so a single
+# lockfile covers both CUDA and CPU-only machines. macOS (and other
+# platforms) resolve torch from PyPI as the CPU build.
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu121", marker = "sys_platform == 'win32' or (sys_platform == 'linux' and platform_machine == 'x86_64')" },
+]
+
+# The project is run from the repository root (`python train.py`);
+# `src/` is a namespace package and is not installed, so uv treats
+# this as a virtual project rather than building/installing it.
+[tool.uv]
+package = false

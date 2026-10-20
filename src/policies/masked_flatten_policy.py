@@ -12,6 +12,27 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.ppo.policies import MultiInputPolicy
 
 
+def _resolve_channel_flags(flags: torch.Tensor, n_channels: int, name: str) -> torch.Tensor:
+    """Validate per-channel layer flags and return them as (B, n_channels).
+
+    Layer flags select whole feature planes (one flag per channel); they are
+    not element-wise spatial masks.
+    """
+    if flags.dim() == 1:
+        flags = flags.unsqueeze(0)
+    if flags.dim() != 2:
+        raise ValueError(
+            f"'{name}' must be per-channel flags of shape (B, {n_channels}) or "
+            f"({n_channels},), got {tuple(flags.shape)}; spatial masks are not supported."
+        )
+    if flags.shape[1] != n_channels:
+        raise ValueError(
+            f"'{name}' has {flags.shape[1]} channel flags but the observation has "
+            f"{n_channels} channels."
+        )
+    return flags
+
+
 class VectorLayerNormExtractor(BaseFeaturesExtractor):
     """Embedding-aware extractor with explicit masks + LayerNorm on vector.
 
@@ -80,13 +101,21 @@ class VectorLayerNormExtractor(BaseFeaturesExtractor):
         self._flatten = nn.Flatten()
 
     @staticmethod
-    def _layer_index(layer_feature):
-        if hasattr(layer_feature, "index"):
-            return layer_feature.index
+    def _layer_index(layer_feature, name=None, meta_list=None):
+        idx = getattr(layer_feature, "index", None)
+        if isinstance(idx, int):
+            return idx
         try:
             return int(layer_feature)
         except Exception:
-            return int(getattr(layer_feature, "id", 0))
+            pass
+        # PySC2 exposes ScreenFeatures/MinimapFeatures fields as namedtuple
+        # descriptors (not ints), so fall back to the layer name.
+        if name is not None and meta_list is not None:
+            for i, meta in enumerate(meta_list):
+                if getattr(meta, "name", None) == name:
+                    return i
+        return 0
 
     @staticmethod
     def _is_categorical(meta) -> bool:
@@ -102,8 +131,8 @@ class VectorLayerNormExtractor(BaseFeaturesExtractor):
         cat_info = []
         cont_idx = []
         in_channels = 0
-        for i, (layer_feature, _name) in enumerate(layers):
-            li = self._layer_index(layer_feature)
+        for i, (layer_feature, name) in enumerate(layers):
+            li = self._layer_index(layer_feature, name, meta_list)
             meta = meta_list[li]
             if self._is_categorical(meta):
                 num = int(getattr(meta, "scale", 0) or 0)
@@ -152,24 +181,17 @@ class VectorLayerNormExtractor(BaseFeaturesExtractor):
             return 0
         return cnn_output_dim
 
-    def _apply_channel_flags(self, x: torch.Tensor, flags: torch.Tensor) -> torch.Tensor:
-        if flags is None:
-            return x
-        if x.dim() != 4 or flags.dim() != 2:
-            return x
-        if x.shape[1] == flags.shape[1]:
-            return x * flags[:, :, None, None]
-        if x.shape[-1] == flags.shape[1]:
-            return x * flags[:, None, None, :]
-        return x
-
-    def _embed_spatial(self, x: torch.Tensor, flags: torch.Tensor, cat_info, cont_idx, emb_layers):
+    def _embed_spatial(self, x: torch.Tensor, flags: torch.Tensor, cat_info, cont_idx, emb_layers, flags_name: str = "layer_flags"):
         if x.dim() != 4:
             return None
         # convert to (B,H,W,C)
         if x.shape[1] == (len(cat_info) + len(cont_idx)):
             x = x.permute(0, 2, 3, 1)
-        x = self._apply_channel_flags(x, flags)
+
+        ch_flags = None
+        if flags is not None:
+            ch_flags = _resolve_channel_flags(flags.float(), x.shape[-1], flags_name)
+            x = x * ch_flags[:, None, None, :]
 
         parts = []
         emb_i = 0
@@ -179,6 +201,10 @@ class VectorLayerNormExtractor(BaseFeaturesExtractor):
                 idx, num, emb_dim = next(ci for ci in cat_info if ci[0] == i)
                 vals = x[..., i].round().clamp(0, num - 1).long()
                 emb = emb_layers[emb_i](vals)
+                if ch_flags is not None:
+                    # embedding(0) is a learned non-zero vector, so zeroing the
+                    # raw channel is not enough: kill the embedding output too.
+                    emb = emb * ch_flags[:, i, None, None, None]
                 emb_i += 1
                 parts.append(emb)
             else:
@@ -202,14 +228,14 @@ class VectorLayerNormExtractor(BaseFeaturesExtractor):
         if self._screen_cnn is not None and "screen" in observations:
             screen = observations["screen"]
             screen_flags = observations.get("screen_layer_flags")
-            screen_feat = self._embed_spatial(screen, screen_flags, self._screen_cat_info, self._screen_cont_idx, self._screen_embeddings)
+            screen_feat = self._embed_spatial(screen, screen_flags, self._screen_cat_info, self._screen_cont_idx, self._screen_embeddings, "screen_layer_flags")
             if screen_feat is not None:
                 encoded.append(self._screen_cnn(screen_feat))
 
         if self._minimap_cnn is not None and "minimap" in observations:
             minimap = observations["minimap"]
             minimap_flags = observations.get("minimap_layer_flags")
-            minimap_feat = self._embed_spatial(minimap, minimap_flags, self._minimap_cat_info, self._minimap_cont_idx, self._minimap_embeddings)
+            minimap_feat = self._embed_spatial(minimap, minimap_flags, self._minimap_cat_info, self._minimap_cont_idx, self._minimap_embeddings, "minimap_layer_flags")
             if minimap_feat is not None:
                 encoded.append(self._minimap_cnn(minimap_feat))
 
@@ -223,20 +249,15 @@ class VectorLayerNormExtractor(BaseFeaturesExtractor):
 class MaskedFlattenPolicy(MultiInputPolicy):
     """Applies action_mask on the first categorical (function id) of a MultiDiscrete action space."""
 
-    def _apply_action_mask(self, action_logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        nvec = self.action_space.nvec
-        func_dim = int(nvec[0])
-        func_logits = action_logits[:, :func_dim]
-        rest_logits = action_logits[:, func_dim:]
-        # mask==0 -> set logit to large negative
-        mask = mask.to(action_logits.device)
-        func_logits = func_logits + (mask <= 0).float() * (-1e9)
-        return torch.cat([func_logits, rest_logits], dim=1)
+    def _build(self, lr_schedule) -> None:
+        # Spatial action heads must be registered before SB3 builds the
+        # optimizer from ``self.parameters()``, otherwise they would be
+        # silently excluded from optimization.
+        self._build_spatial_heads()
+        super()._build(lr_schedule)
 
-    def _build_slot_map_if_needed(self, device=None):
-        # Build param semantics and fn->slot mapping consistent with PySC2GymEnv
-        if getattr(self, "_slot_map_built", False):
-            return
+    def _build_spatial_heads(self) -> None:
+        """Create spatial action heads eagerly from observation/action spaces."""
         param_semantics = []
         param_semantics_set = set()
         for fn in pysc2_actions.FUNCTIONS:
@@ -249,29 +270,94 @@ class MaskedFlattenPolicy(MultiInputPolicy):
         # fn_id -> list of slot indices (in param_semantics order)
         fn_param_map = {}
         for fn in pysc2_actions.FUNCTIONS:
-            slot_indices = []
-            for spec in fn.args:
-                name = getattr(spec, "name")
-                slot_indices.append(param_semantics.index(name))
-            fn_param_map[fn.id] = slot_indices
+            fn_param_map[fn.id] = [param_semantics.index(getattr(spec, "name")) for spec in fn.args]
 
         # slot sizes come from action_space.nvec (skip first entry which is fn head)
-        nvec = list(self.action_space.nvec)
-        slot_sizes = nvec[1:]
+        slot_sizes = [int(x) for x in list(self.action_space.nvec)[1:]]
+        if len(slot_sizes) != len(param_semantics):
+            raise ValueError(
+                f"action_space has {len(slot_sizes)} argument slots but PySC2 defines "
+                f"{len(param_semantics)} unique argument names; spatial action heads cannot be aligned."
+            )
 
-        # build fn -> binary mask over slots tensor for fast indexing
-        n_funcs = int(nvec[0])
+        self._param_semantics = param_semantics
+        self._fn_param_map = fn_param_map
+        self._slot_sizes = slot_sizes
+        self._screen_slot_idx = param_semantics.index("screen") if "screen" in param_semantics else None
+        self._minimap_slot_idx = param_semantics.index("minimap") if "minimap" in param_semantics else None
+
+        # fn -> binary mask over slots, used for joint log_prob/entropy.
+        # Non-persistent buffer: it follows policy.to(device) but is not part of
+        # the checkpoint (it is fully derived from the action space).
+        n_funcs = int(list(self.action_space.nvec)[0])
         n_slots = len(slot_sizes)
         fn_slot_mask = torch.zeros((n_funcs, n_slots), dtype=torch.float32)
         for fid, slots in fn_param_map.items():
             for s in slots:
                 if s < n_slots:
                     fn_slot_mask[fid, s] = 1.0
+        self.register_buffer("_fn_slot_mask", fn_slot_mask, persistent=False)
 
-        self._param_semantics = param_semantics
-        self._fn_param_map = fn_param_map
-        self._slot_sizes = slot_sizes
-        self._fn_slot_mask = fn_slot_mask.to(device) if device is not None else fn_slot_mask
+        spaces = getattr(self.observation_space, "spaces", {})
+        screen_in_ch = self._spatial_channels(spaces.get("screen"))
+        minimap_in_ch = self._spatial_channels(spaces.get("minimap"))
+
+        # simple two-layer conv producing 1-channel spatial logits
+        if screen_in_ch is not None and self._screen_slot_idx is not None:
+            self._screen_spatial_net = nn.Sequential(
+                nn.Conv2d(screen_in_ch, 32, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(32, 1, kernel_size=1),
+            )
+            self._screen_in_ch = screen_in_ch
+            # log-scale keeps the multiplier positive and differentiable;
+            # initialized to 0 -> scale == 1, matching the previous behavior.
+            self._screen_spatial_log_scale = nn.Parameter(torch.zeros(()))
+        else:
+            self._screen_spatial_net = None
+            self._screen_in_ch = None
+
+        if minimap_in_ch is not None and self._minimap_slot_idx is not None:
+            self._minimap_spatial_net = nn.Sequential(
+                nn.Conv2d(minimap_in_ch, 32, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(32, 1, kernel_size=1),
+            )
+            self._minimap_in_ch = minimap_in_ch
+            self._minimap_spatial_log_scale = nn.Parameter(torch.zeros(()))
+        else:
+            self._minimap_spatial_net = None
+            self._minimap_in_ch = None
+
+    @staticmethod
+    def _spatial_channels(space):
+        if space is None:
+            return None
+        shape = getattr(space, "shape", None)
+        if shape is None or len(shape) != 3:
+            return None
+        # observation space is (H, W, C)
+        return int(shape[2])
+
+    def _apply_action_mask(self, action_logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        nvec = self.action_space.nvec
+        func_dim = int(nvec[0])
+        func_logits = action_logits[:, :func_dim]
+        rest_logits = action_logits[:, func_dim:]
+        # mask==0 -> set logit to large negative
+        mask = mask.to(action_logits.device)
+        func_logits = func_logits + (mask <= 0).float() * (-1e9)
+        return torch.cat([func_logits, rest_logits], dim=1)
+
+    def _build_slot_map_if_needed(self):
+        # Slot mask is built eagerly in _build_spatial_heads; this method only
+        # performs the one-time environment snapshot cross-check.
+        if getattr(self, "_slot_map_built", False):
+            return
+        if not hasattr(self, "_param_semantics"):
+            # Safety net for construction paths that bypass _build().
+            self._build_spatial_heads()
+
         self._slot_map_built = True
         # One-time cross-check against environment snapshot (if present)
         try:
@@ -304,81 +390,6 @@ class MaskedFlattenPolicy(MultiInputPolicy):
                         pass
         except Exception:
             pass
-        # Build spatial action heads (minimal: small conv -> 1-channel spatial logits)
-        try:
-            obs_space = getattr(self, 'observation_space', None)
-            if obs_space is not None and hasattr(obs_space, 'spaces'):
-                # screen
-                screen_space = obs_space.spaces.get('screen')
-                if screen_space is not None:
-                    sh = screen_space.shape
-                    if len(sh) == 3:
-                        # (H, W, C)
-                        screen_in_ch = int(sh[2])
-                    else:
-                        screen_in_ch = None
-                else:
-                    screen_in_ch = None
-
-                minimap_space = obs_space.spaces.get('minimap')
-                if minimap_space is not None:
-                    mh = minimap_space.shape
-                    if len(mh) == 3:
-                        minimap_in_ch = int(mh[2])
-                    else:
-                        minimap_in_ch = None
-                else:
-                    minimap_in_ch = None
-
-                # find indices of 'screen'/'minimap' in slot semantics
-                try:
-                    self._screen_slot_idx = self._param_semantics.index('screen') if 'screen' in self._param_semantics else None
-                except Exception:
-                    self._screen_slot_idx = None
-                try:
-                    self._minimap_slot_idx = self._param_semantics.index('minimap') if 'minimap' in self._param_semantics else None
-                except Exception:
-                    self._minimap_slot_idx = None
-
-                import torch.nn as nn
-                # create small conv heads when channels and slot indices are available
-                if screen_in_ch is not None and self._screen_slot_idx is not None:
-                    # simple two-layer conv producing 1-channel spatial logits
-                    self._screen_spatial_net = nn.Sequential(
-                        nn.Conv2d(screen_in_ch, 32, kernel_size=3, padding=1),
-                        nn.ReLU(),
-                        nn.Conv2d(32, 1, kernel_size=1)
-                    )
-                    self._screen_in_ch = screen_in_ch
-                    try:
-                        # learnable scale for spatial logits to control softmax sharpness
-                        self._screen_spatial_scale = nn.Parameter(torch.tensor(1.0))
-                    except Exception:
-                        self._screen_spatial_scale = None
-                else:
-                    self._screen_spatial_net = None
-                    self._screen_in_ch = None
-
-                if minimap_in_ch is not None and self._minimap_slot_idx is not None:
-                    self._minimap_spatial_net = nn.Sequential(
-                        nn.Conv2d(minimap_in_ch, 32, kernel_size=3, padding=1),
-                        nn.ReLU(),
-                        nn.Conv2d(32, 1, kernel_size=1)
-                    )
-                    self._minimap_in_ch = minimap_in_ch
-                    try:
-                        self._minimap_spatial_scale = nn.Parameter(torch.tensor(1.0))
-                    except Exception:
-                        self._minimap_spatial_scale = None
-                else:
-                    self._minimap_spatial_net = None
-                    self._minimap_in_ch = None
-        except Exception:
-            # non-critical
-            self._screen_spatial_net = None
-            self._minimap_spatial_net = None
-            self._screen_slot_idx = None
-            self._minimap_slot_idx = None
 
     def _joint_logprob_and_entropy(self, logits: torch.Tensor, actions: torch.Tensor):
         """Compute joint log_prob and entropy while ignoring unused arg slots per-sample.
@@ -387,8 +398,7 @@ class MaskedFlattenPolicy(MultiInputPolicy):
         actions: (B, n_actions)  # first col is fn_id, following are slot values (can be -1)
         Returns: log_prob (B,), entropy (B,)
         """
-        device = logits.device
-        self._build_slot_map_if_needed(device=device)
+        self._build_slot_map_if_needed()
         nvec = list(self.action_space.nvec)
         # split logits per head
         sizes = [int(x) for x in nvec]
@@ -491,7 +501,7 @@ class MaskedFlattenPolicy(MultiInputPolicy):
         Uses expected slot usage under fn distribution: E[entropy] = H(fn) + sum_i E[used_i] * H(arg_i)
         """
         device = logits.device
-        self._build_slot_map_if_needed(device=device)
+        self._build_slot_map_if_needed()
         nvec = list(self.action_space.nvec)
         sizes = [int(x) for x in nvec]
         splits = torch.split(logits, sizes, dim=1)
@@ -534,43 +544,41 @@ class MaskedFlattenPolicy(MultiInputPolicy):
         slot_sizes = [int(x) for x in sizes[1:]]
 
         # helper: inject for a single head
-        def _inject(net, slot_idx, in_ch, key):
+        def _inject(net, slot_idx, in_ch, key, flags_key, log_scale):
             if net is None or slot_idx is None:
                 return
             if key not in obs:
                 return
             x = obs[key]
             if not isinstance(x, torch.Tensor):
-                try:
-                    x = torch.as_tensor(x, device=device)
-                except Exception:
-                    return
+                x = torch.as_tensor(x, device=device)
             x = x.float().to(device)
             if x.dim() != 4:
-                return
+                raise ValueError(
+                    f"obs['{key}'] must be 4D (B,H,W,C) or (B,C,H,W), got shape {tuple(x.shape)}"
+                )
             # accept (B,H,W,C) or (B,C,H,W)
             if x.shape[-1] == in_ch:
                 x_t = x.permute(0, 3, 1, 2)
             elif x.shape[1] == in_ch:
                 x_t = x
             else:
-                return
-            try:
-                out_map = net(x_t)  # (B,1,H,W)
-                out_flat = out_map.view(out_map.shape[0], -1)
-            except Exception:
-                return
-            # apply learnable scale if present to control numeric magnitude
-            try:
-                if slot_idx is not None:
-                    if key == 'screen' and getattr(self, '_screen_spatial_scale', None) is not None:
-                        scale = getattr(self, '_screen_spatial_scale')
-                        out_flat = out_flat * float(scale)
-                    if key == 'minimap' and getattr(self, '_minimap_spatial_scale', None) is not None:
-                        scale = getattr(self, '_minimap_spatial_scale')
-                        out_flat = out_flat * float(scale)
-            except Exception:
-                pass
+                raise ValueError(
+                    f"obs['{key}'] channel count does not match head input: "
+                    f"leading={x.shape[1]}, trailing={x.shape[-1]}, expected {in_ch}"
+                )
+            flags = obs.get(flags_key)
+            if flags is not None:
+                if not isinstance(flags, torch.Tensor):
+                    flags = torch.as_tensor(flags, device=device)
+                flags = _resolve_channel_flags(flags.float().to(device), in_ch, flags_key)
+                # per-channel layer flags, not an element-wise spatial mask
+                x_t = x_t * flags[:, :, None, None]
+            out_map = net(x_t)  # (B,1,H,W)
+            out_flat = out_map.view(out_map.shape[0], -1)
+            if log_scale is not None:
+                # scale = exp(log_scale): positive, differentiable, initialized to 1.
+                out_flat = out_flat * torch.exp(log_scale.clamp(-6.0, 6.0))
             slot_size = slot_sizes[slot_idx]
             if out_flat.shape[1] != slot_size:
                 if out_flat.shape[1] > slot_size:
@@ -581,11 +589,22 @@ class MaskedFlattenPolicy(MultiInputPolicy):
             end = start + slot_size
             logits[:, start:end] = out_flat
 
-        try:
-            _inject(getattr(self, '_screen_spatial_net', None), getattr(self, '_screen_slot_idx', None), getattr(self, '_screen_in_ch', None), 'screen')
-            _inject(getattr(self, '_minimap_spatial_net', None), getattr(self, '_minimap_slot_idx', None), getattr(self, '_minimap_in_ch', None), 'minimap')
-        except Exception:
-            pass
+        _inject(
+            getattr(self, '_screen_spatial_net', None),
+            getattr(self, '_screen_slot_idx', None),
+            getattr(self, '_screen_in_ch', None),
+            'screen',
+            'screen_layer_flags',
+            getattr(self, '_screen_spatial_log_scale', None),
+        )
+        _inject(
+            getattr(self, '_minimap_spatial_net', None),
+            getattr(self, '_minimap_slot_idx', None),
+            getattr(self, '_minimap_in_ch', None),
+            'minimap',
+            'minimap_layer_flags',
+            getattr(self, '_minimap_spatial_log_scale', None),
+        )
         return logits
 
     def _get_masked_distribution(self, obs):
@@ -595,10 +614,7 @@ class MaskedFlattenPolicy(MultiInputPolicy):
         if isinstance(self.action_dist, MultiCategoricalDistribution) and "available_actions" in obs:
             logits = self._apply_action_mask(logits, obs["available_actions"])
         # inject spatial logits (screen/minimap) if available
-        try:
-            logits = self._inject_spatial_logits(logits, obs)
-        except Exception:
-            pass
+        logits = self._inject_spatial_logits(logits, obs)
         base_dist = self.action_dist.proba_distribution(logits)
 
         # Wrapper to override log_prob and entropy using joint per-slot masking
@@ -643,10 +659,7 @@ class MaskedFlattenPolicy(MultiInputPolicy):
 
         # inject spatial logits (screen/minimap) so flat slots for spatial args come
         # from spatial conv maps instead of learned flat heads
-        try:
-            logits = self._inject_spatial_logits(logits, obs)
-        except Exception:
-            pass
+        logits = self._inject_spatial_logits(logits, obs)
 
         # 3. 构造分布并采样，确保每个头只采样唯一语义参数
         distribution = self.action_dist.proba_distribution(logits)
@@ -678,10 +691,7 @@ class MaskedFlattenPolicy(MultiInputPolicy):
             logits = self._apply_action_mask(logits, obs["available_actions"])
 
         # ensure evaluation uses same injected spatial logits
-        try:
-            logits = self._inject_spatial_logits(logits, obs)
-        except Exception:
-            pass
+        logits = self._inject_spatial_logits(logits, obs)
 
         # compute joint log_prob and entropy using sample-level mask
         if not isinstance(actions, torch.Tensor):

@@ -23,8 +23,9 @@ env.bak/
 *.sublime-project
 *.sublime-workspace
 
-# Jupyter
+# Jupyter / pytest caches
 .ipynb_checkpoints/
+.pytest_cache/
 
 # Environment variables
 .env
@@ -43,9 +44,6 @@ checkpoints/
 *.log
 logs/
 reports/
-
-# Tests
-src/tests/
 
 # OS files
 .DS_Store
