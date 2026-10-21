@@ -4,9 +4,13 @@
 状态说明：`P0` 阻塞正式训练，`P1` 影响训练效率或结果可信度，`P2` 代码健壮性/维护性。
 
 > 2026-10-21 更新：P0-1、P0-2、P1-3、P1-4、P1-5、P2-6、P2-7 已修复并提交
-> （commits 2a361e0 / 2d8ef0f / bbe1b52）；P2-11 核查后确认代码已是新版 API 无需改动。
+> （commits 2a361e0 / 2d8ef0f / bbe1b52）；P2-11 的 `metadata` 已改，`render` 签名仍为旧格式。
 > 剩余待办：P2-8（JointMaskedDistribution 接口补全）、P2-9（逐元素 CPU 同步）、
 > P2-10（特征复用，框架限制）——均不阻塞训练，待首次正式实验后再评估。
+>
+> 2026-10-21 补充：验证了 `unset DISPLAY` 下 SubprocVecEnv 训练正常，SC2 以无头方式运行，
+> 因此移除 `DISPLAY`/Xvfb 依赖：`scripts/env.sh` 只保留 `SC2PATH`，preflight 将 DISPLAY
+> 缺失从 FAIL 降为 SKIP。此前“需要 X 显示”的假设不成立，属于多余依赖。
 
 ## P0：阻塞首次正式训练
 

@@ -17,6 +17,7 @@ from train import REQUIRED_CONFIG_KEYS, resolve_device
 CONFIG_PATHS = [
     os.path.join(REPO_ROOT, "configs", "ppo_config.yaml"),
     os.path.join(REPO_ROOT, "configs", "bitahub_first_run.yaml"),
+    os.path.join(REPO_ROOT, "configs", "bitahub_smoke.yaml"),
 ]
 
 
@@ -71,6 +72,25 @@ def test_configs_contain_required_keys(config_path):
         cfg = yaml.safe_load(f)
     missing = [key for key in REQUIRED_CONFIG_KEYS if key not in cfg]
     assert not missing, f"{config_path} is missing required keys: {missing}"
+
+
+def test_vec_env_cls_is_required_without_default():
+    """The VecEnv type trades memory for throughput; no silent default allowed."""
+    assert "vec_env_cls" in REQUIRED_CONFIG_KEYS
+    signature = inspect.signature(train_module.make_seeded_vec_env)
+    assert signature.parameters["vec_env_cls"].default is inspect.Parameter.empty
+
+
+def test_missing_vec_env_cls_fails_fast():
+    with pytest.raises(ValueError, match="vec_env_cls"):
+        train_module.resolve_vec_env_cls(None)
+
+
+def test_vec_env_cls_is_normalized_and_validated():
+    assert train_module.resolve_vec_env_cls(" Dummy ") == "dummy"
+    assert train_module.resolve_vec_env_cls("subproc") == "subproc"
+    with pytest.raises(ValueError, match="vec_env_cls"):
+        train_module.resolve_vec_env_cls("serial")
 
 
 def test_default_and_bitahub_configs_declare_device():

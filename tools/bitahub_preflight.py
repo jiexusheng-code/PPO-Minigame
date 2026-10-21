@@ -26,7 +26,7 @@ DEFAULT_CONFIG = REPO_ROOT / "configs" / "bitahub_first_run.yaml"
 
 # Keys read with require() in train.py. checkpoint_path is optional there.
 REQUIRED_KEYS = [
-    "env", "out_dir", "n_envs", "seed", "device", "policy", "policy_kwargs", "env_kwargs",
+    "env", "out_dir", "n_envs", "vec_env_cls", "seed", "device", "policy", "policy_kwargs", "env_kwargs",
     "total_timesteps", "learning_rate", "ent_coef", "batch_size", "n_epochs",
     "gamma", "gae_lambda", "n_steps", "clip_range", "vf_coef", "max_grad_norm",
     "save_iters", "summary_iters", "eval_every", "n_eval_episodes",
@@ -178,35 +178,21 @@ def check_sc2(rep):
 
 
 def check_display(rep):
+    """DISPLAY is optional: the wrapper runs with visualize=false (headless).
+
+    Verified on the cloud host that training works with DISPLAY unset, so a
+    missing DISPLAY is not a blocker. A set-but-unreachable DISPLAY is only a
+    warning, since it matters solely for visualize=true.
+    """
     if not sys.platform.startswith("linux"):
         rep.skip("DISPLAY", f"仅 Linux 检查（当前 {sys.platform}）")
         return
     display = os.environ.get("DISPLAY")
     if not display:
-        # 检查 Xvfb 是否在运行
-        xvfb_running = False
-        try:
-            result = subprocess.run(
-                ["pgrep", "-x", "Xvfb"], capture_output=True, text=True, timeout=5
-            )
-            xvfb_running = result.returncode == 0
-        except Exception:
-            pass
-
-        if xvfb_running:
-            rep.fail(
-                "DISPLAY",
-                "未设置，但检测到 Xvfb 在运行。"
-                "请执行: export DISPLAY=:99 或 source scripts/env.sh"
-            )
-        else:
-            rep.fail(
-                "DISPLAY",
-                "未设置；SC2 需要 X 显示。建议先执行: "
-                "Xvfb :99 -screen 0 1024x768x24 & export DISPLAY=:99"
-            )
-        if shutil.which("Xvfb") is None:
-            rep.warn("Xvfb", "未找到 Xvfb；无头实例需先安装/提供 X server")
+        rep.skip(
+            "DISPLAY",
+            "未设置；visualize=false 时 SC2 无头运行，无需 X server",
+        )
         return
 
     # DISPLAY being set only means the variable exists; it does not prove the
@@ -334,11 +320,14 @@ def check_config(rep, config_path, torch=None):
         rep.fail("legacy key eval_freq", "train.py 会拒绝该键，请使用 eval_every")
 
     total_timesteps = cfg.get("total_timesteps")
-    if (isinstance(total_timesteps, bool) or not isinstance(total_timesteps, int)
-            or total_timesteps <= 0):
-        rep.fail(
+    if isinstance(total_timesteps, bool) or not isinstance(total_timesteps, int):
+        rep.fail("total_timesteps", f"必须为整数，当前为 {total_timesteps!r}")
+    elif total_timesteps <= 0:
+        # Unbounded training is an explicit choice: stop with SIGINT, which
+        # train.py handles by saving the final model and closing all envs.
+        rep.warn(
             "total_timesteps",
-            f"必须为 >0 的整数，当前为 {total_timesteps!r}（<=0 表示无限训练，云端不可用）",
+            "<=0：持续训练直到手动中断（SIGINT/Ctrl+C），中断后保存 final_model",
         )
     else:
         rep.ok("total_timesteps", str(total_timesteps))
@@ -352,6 +341,15 @@ def check_config(rep, config_path, torch=None):
             rep.ok("batch_size <= n_envs*n_steps", f"{batch_size} <= {rollout}")
         else:
             rep.fail("batch_size <= n_envs*n_steps", f"{batch_size} > {rollout}")
+
+    vec_env_cls = cfg.get("vec_env_cls")
+    if vec_env_cls is None:
+        # Already reported by the missing-required-keys check above.
+        pass
+    elif str(vec_env_cls).strip().lower() in ("dummy", "subproc"):
+        rep.ok("vec_env_cls", str(vec_env_cls).strip().lower())
+    else:
+        rep.fail("vec_env_cls", f"必须为 dummy 或 subproc，当前为 {vec_env_cls!r}")
 
     check_device_config(rep, cfg, torch)
 

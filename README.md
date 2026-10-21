@@ -5,7 +5,7 @@
 > **项目状态**：
 > - ✅ 本地验证完成（smoke test 通过）
 > - ✅ 云端环境配置就绪
-> - ⏳ 等待首次 1M 步实验执行
+> - ⏳ 等待首次正式训练（5M 步）执行
 > - 尚无正式基准结论
 
 ## 技术栈
@@ -64,20 +64,17 @@ uv run pytest -q
 
 ## 云端环境配置
 
-在 Bitahub 或其他云端环境首次使用时，需要配置环境变量：
+本项目以 `visualize: false` 运行，SC2 无头启动，**不需要 X server 或 `DISPLAY`**，只需指定 SC2 安装路径：
 
 ```bash
-# 方式 1：每次会话手动设置
-export SC2PATH=/mnt/ppo/StarCraftII
-export DISPLAY=:99
-
-# 方式 2：使用项目提供的环境脚本（推荐）
+# 方式 1：使用项目提供的环境脚本（推荐）
 source scripts/env.sh
+
+# 方式 2：每次会话手动设置
+export SC2PATH=/mnt/ppo/StarCraftII
 
 # 方式 3：写入 ~/.bashrc（永久生效）
 echo 'export SC2PATH=/mnt/ppo/StarCraftII' >> ~/.bashrc
-echo 'export DISPLAY=:99' >> ~/.bashrc
-source ~/.bashrc
 ```
 
 配置完成后，运行 preflight 检查：
@@ -118,28 +115,43 @@ PowerShell：
 $env:TRAIN_CONFIG_PATH="configs/bitahub_first_run.yaml"; uv run python train.py
 ```
 
-`configs/bitahub_first_run.yaml` 固定为 1,000,000 步，用于首次云端验证，不是正式基准实验。
+`configs/bitahub_first_run.yaml` 固定为 5,000,000 步（8 环境 × 32 步 rollout，约 9 小时），作为首轮正式训练。
+它是单 seed 结果，用于验证学习趋势，不作为最终基准结论。
 
 ## 性能优化配置
 
 ### 并行环境
 
-- `vec_env_cls: "subproc"`：使用多进程并行环境，充分利用多核 CPU（推荐用于正式训练）
-- `vec_env_cls: "dummy"`：单进程串行环境，便于调试和排查问题
+- `vec_env_cls: "subproc"`：每个环境一个子进程，真正并行采样，适合多核云端实例
+- `vec_env_cls: "dummy"`：所有环境在同一进程内串行推进，额外内存开销小，适合本地调试
+
+该键**必填且没有代码默认值**，缺失时 `train.py` 会在启动 SC2 之前直接报错。
+当前约定：`configs/ppo_config.yaml` 用 `dummy`（本地），两份 `configs/bitahub_*.yaml` 用 `subproc`（云端）。
+本地若误写 `subproc`，每个环境都会额外启动一个 Python 子进程并重新导入 torch/SB3。
 
 ### 评估频率
 
-`eval_every` 控制评估间隔（单位：训练步数）：
+`eval_every` 的单位是 **optimization-step**（一次完整 rollout + 更新），不是环境步：
 
-- 较小值（如 10000）：更频繁评估，曲线更平滑，但会增加训练时间
-- 较大值（如 50000）：减少评估开销，加快训练，但曲线粒度粗
+```text
+1 opt-step = n_envs × n_steps 环境步
+当前云端配置：1 opt-step = 8 × 32 = 256 env-steps
+```
+
+- 较小值（如 50，约 12800 env-steps）：评估更频繁，曲线更平滑，但评估开销占比上升
+- 较大值（如 500，约 128000 env-steps，云端正式训练取值）：减少评估开销，曲线粒度变粗
+
+5M 步下取 500 约触发 39 次评估，每次 10 个 episode（确定性策略）。
 
 ### Checkpoint 策略
 
-`save_iters` 控制模型保存频率（单位：训练步数）：
+`save_iters` 同样以 **optimization-step** 为单位：
 
-- 较小值：更频繁保存，便于回滚，但占用更多磁盘空间
+- 1000（云端正式训练取值）：5M 步下约 19 次保存，单模型约 33MB，合计约 630MB
+- 较小值：回滚粒度更细，但占用更多磁盘空间
 - 较大值：减少磁盘占用，但回滚粒度粗
+
+设置 `save_best_model: true` 时，发现更优模型以及训练结束都会清理 `checkpoint_opt_*.zip`，只保留最佳/最终模型。
 
 建议首次实验使用默认配置，待稳定后根据实际需求调整。
 

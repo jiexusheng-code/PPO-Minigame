@@ -4,8 +4,10 @@ checkpoint_path:
 
 # ----------------- 基本运行/并行设置 -----------------
 # 说明：这些参数决定采样规模与并行度，影响采样效率、GPU/CPU/内存占用和学习稳定性
-n_envs: 32                   # 并行环境数量（整数）。含义：同时并行多少个环境进行采样。
-                             # 推荐：32（pysc2-rl-agents 默认）。资源允许时可增大，但会线性增加 CPU/内存/显存开销。
+n_envs: 8                    # 并行环境数量（整数）。含义：同时并行多少个环境进行采样。
+                             # 本地按 8 配置：每个环境都是一个 SC2 进程（约 1-2GB），32 个会超出笔记本内存。
+vec_env_cls: dummy           # 必填，无代码默认值。dummy：单进程串行，额外内存开销小，适合本地；
+                             # subproc：每个环境一个子进程，多核并行，适合云端。
 seed: 0                      # 全局随机种子（整数）。用于复现实验。
 device: auto                 # 计算设备：auto（默认，CUDA 可用则用 GPU，否则 CPU）/ cpu / cuda / cuda:0。
                              # 显式写 cuda 但 CUDA 不可用时会直接报错（避免在 GPU 机器上误用 CPU 长时间训练）。
@@ -31,15 +33,15 @@ total_timesteps: -1          # 建议范围：1e5 ~ 1e7，依据问题复杂度�
 
 # ----------------- 优化超参数（PPO） -----------------
 # 这些参数控制优化器与损失构成，推荐值参考 pysc2-rl-agents 配置
-learning_rate: 7e-4          # 学习率（float）。推荐起始值：7e-4；若训练不稳定可减小到 1e-4 ~ 3e-4
+learning_rate: 3e-4          # 学习率（float）。PPO + Adam 常用 3e-4；7e-4 是 A2C + RMSProp 的习惯值。
 ent_coef: 0.001              # 策略熵系数（float），鼓励探索。对应 pysc2 中 entropy_weight=1e-3
 batch_size: 128              # SB3 的 minibatch 大小（每个 epoch 使用的小批量样本数）。注：总体样本量 = n_envs * n_steps
-                             # 推荐：64-256，常用 128
+                             # 当前 rollout = 8 * 32 = 256，即每个 epoch 2 个 minibatch
 n_epochs: 4                  # 每次 rollout 收集的样本用于优化时，进行多少个 epoch（数据重复利用次数）。pysc2 默认 4
 gamma: 0.99                  # 折扣因子
 gae_lambda: 0.95             # GAE 的 lambda，用于优势估计
-n_steps: 16                  # 每个环境在一次 rollout 中采样的步数（整数）。1 optimization-step = n_envs * n_steps 环境步
-                             # pysc2-rl-agents 常用 n_steps=16，配合 n_envs=32 时每次 rollout 包含 512 env-steps
+n_steps: 32                  # 每个环境在一次 rollout 中采样的步数（整数）。1 optimization-step = n_envs * n_steps 环境步
+                             # rollout 至少 256 条样本再更新一次，避免单 minibatch 更新带来的高梯度噪声
 clip_range: 0.2              # PPO 裁剪范围（float），限制重要性权重 ratio 的偏差，常用 0.1-0.3
 vf_coef: 0.5                 # value loss 系数
 max_grad_norm: 0.5           # 梯度裁剪阈值

@@ -20,8 +20,8 @@ PPO_PARAM_KEYS = (
 )
 
 REQUIRED_CONFIG_KEYS = (
-    "env", "out_dir", "n_envs", "seed", "device", "total_timesteps", "policy",
-    "policy_kwargs", "env_kwargs",
+    "env", "out_dir", "n_envs", "vec_env_cls", "seed", "device", "total_timesteps",
+    "policy", "policy_kwargs", "env_kwargs",
 ) + PPO_PARAM_KEYS + (
     "save_iters", "summary_iters", "eval_every", "n_eval_episodes",
     "eval_deterministic", "eval_render", "tensorboard", "tb_log_dir",
@@ -158,7 +158,26 @@ def make_env_fn(map_name: str, env_kwargs=None, random_seed=None):
     return _init
 
 
-def make_seeded_vec_env(map_name: str, env_kwargs, n_envs, seed, offset=0, vec_env_cls="subproc"):
+def resolve_vec_env_cls(value):
+    """Validate the configured VecEnv type.
+
+    There is intentionally no default: the choice trades memory/CPU for
+    throughput, and picking wrong silently (e.g. spawning one process per env
+    on a laptop) is worse than failing fast. Every config must declare it.
+    """
+    if value is None:
+        raise ValueError(
+            "vec_env_cls must be declared explicitly in the config as 'dummy' or 'subproc'"
+        )
+    normalized = str(value).strip().lower()
+    if normalized not in ("dummy", "subproc"):
+        raise ValueError(
+            f"Unsupported vec_env_cls {value!r}; expected 'dummy' or 'subproc'."
+        )
+    return normalized
+
+
+def make_seeded_vec_env(map_name: str, env_kwargs, n_envs, seed, offset=0, *, vec_env_cls):
     """Build a vectorized environment whose env ``rank`` gets ``seed + offset + rank``.
 
     This mirrors SB3's ``make_vec_env`` (seed + rank) but also passes the same
@@ -172,16 +191,14 @@ def make_seeded_vec_env(map_name: str, env_kwargs, n_envs, seed, offset=0, vec_e
         n_envs: number of parallel environments
         seed: base seed for seeding
         offset: seed offset for evaluation environments
-        vec_env_cls: "dummy" for DummyVecEnv (single-process, serial),
-                     "subproc" for SubprocVecEnv (multi-process, parallel)
+        vec_env_cls: required, "dummy" (single-process, serial) or
+            "subproc" (multi-process, parallel). No default is provided.
     """
     n_envs = int(n_envs)
     if n_envs < 1:
         raise ValueError(f"n_envs must be >= 1, got {n_envs}")
 
-    vec_env_cls_str = str(vec_env_cls).strip().lower()
-    if vec_env_cls_str not in ("dummy", "subproc"):
-        raise ValueError(f"vec_env_cls must be 'dummy' or 'subproc', got {vec_env_cls!r}")
+    vec_env_cls_str = resolve_vec_env_cls(vec_env_cls)
 
     env_fns = []
     for rank in range(n_envs):
@@ -399,8 +416,8 @@ def main():
     base_dir = os.path.join(out_dir_root, today_str)
     out_dir = base_dir
     n_envs = require("n_envs")
-    # Optional: "subproc" (default, multi-process) or "dummy" (single-process).
-    vec_env_cls = cfg.get("vec_env_cls", "subproc")
+    # Required, no default: validate before any SC2 process is spawned.
+    vec_env_cls = resolve_vec_env_cls(require("vec_env_cls"))
     seed = require("seed")
     total_timesteps = require("total_timesteps")
     policy_cfg = require("policy")
@@ -569,7 +586,11 @@ def main():
                         }
                         try:
                             if getattr(self, 'evaluations_length', None) is not None and len(self.evaluations_length) > 0:
-                                eval_stats["mean_ep_length"] = float(self.evaluations_length[-1].mean())
+                                # SB3 2.3 stores evaluations_length as list[list[int]]
+                                # (no .mean()); older versions used a 2-D array.
+                                lengths = list(self.evaluations_length[-1])
+                                if lengths:
+                                    eval_stats["mean_ep_length"] = float(sum(lengths) / len(lengths))
                         except Exception as e:
                             self._logger.warning(f"[EvalCallback] 评估长度聚合失败: {type(e).__name__}: {e}")
                         setattr(self.model, '_last_eval_stats', eval_stats)

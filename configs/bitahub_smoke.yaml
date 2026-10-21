@@ -5,6 +5,7 @@ env: MoveToBeacon
 out_dir: ./models/bitahub_smoke
 
 n_envs: 8
+vec_env_cls: subproc     # 必填，无代码默认值：多进程并行采样
 seed: 0
 device: auto
 
