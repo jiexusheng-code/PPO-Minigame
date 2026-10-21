@@ -134,7 +134,17 @@ def check_sc2(rep):
         rep.warn("SC2PATH", f"未设置，将使用 PySC2 默认路径 {sc2path}")
 
     if not sc2path.is_dir():
-        rep.fail("SC2 目录", f"不存在: {sc2path}（需放置 SC2 本体或导出 SC2PATH）")
+        # 检查常见自定义路径
+        common_paths = [Path("/mnt/ppo/StarCraftII"), Path("/opt/StarCraftII")]
+        found = next((p for p in common_paths if p.is_dir()), None)
+        if found:
+            rep.fail(
+                "SC2 目录",
+                f"不存在: {sc2path}，但发现 {found}。"
+                f"请执行: export SC2PATH={found} 或 source scripts/env.sh"
+            )
+        else:
+            rep.fail("SC2 目录", f"不存在: {sc2path}（需放置 SC2 本体或导出 SC2PATH）")
         return
 
     if sys.platform.startswith("win"):
@@ -173,11 +183,28 @@ def check_display(rep):
         return
     display = os.environ.get("DISPLAY")
     if not display:
-        rep.fail(
-            "DISPLAY",
-            "未设置；SC2 需要 X 显示。建议先执行: "
-            "Xvfb :99 -screen 0 1024x768x24 & export DISPLAY=:99",
-        )
+        # 检查 Xvfb 是否在运行
+        xvfb_running = False
+        try:
+            result = subprocess.run(
+                ["pgrep", "-x", "Xvfb"], capture_output=True, text=True, timeout=5
+            )
+            xvfb_running = result.returncode == 0
+        except Exception:
+            pass
+
+        if xvfb_running:
+            rep.fail(
+                "DISPLAY",
+                "未设置，但检测到 Xvfb 在运行。"
+                "请执行: export DISPLAY=:99 或 source scripts/env.sh"
+            )
+        else:
+            rep.fail(
+                "DISPLAY",
+                "未设置；SC2 需要 X 显示。建议先执行: "
+                "Xvfb :99 -screen 0 1024x768x24 & export DISPLAY=:99"
+            )
         if shutil.which("Xvfb") is None:
             rep.warn("Xvfb", "未找到 Xvfb；无头实例需先安装/提供 X server")
         return
