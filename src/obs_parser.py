@@ -88,9 +88,42 @@ class MoveToBeaconConfig(MapConfig):
         self.minimap_active_layers = {"player_relative", "selected"}
 
 
+class DefeatRoachesConfig(MapConfig):
+    """DefeatRoaches 配置（战斗：需要单位类型与血量）"""
+
+    def __init__(self):
+        super().__init__("DefeatRoaches")
+
+        self.screen_active_layers = {"player_relative", "unit_type", "selected", "unit_hit_points_ratio"}
+        self.minimap_active_layers = {"player_relative", "selected"}
+
+
+class CollectMineralsAndGasConfig(MapConfig):
+    """CollectMineralsAndGas 配置（经济：需要识别矿区单位）"""
+
+    def __init__(self):
+        super().__init__("CollectMineralsAndGas")
+
+        self.screen_active_layers = {"player_relative", "unit_type", "selected"}
+        self.minimap_active_layers = {"player_relative", "selected"}
+
+
+class BuildMarinesConfig(MapConfig):
+    """BuildMarines 配置（建造：经济 + 建造进度）"""
+
+    def __init__(self):
+        super().__init__("BuildMarines")
+
+        self.screen_active_layers = {"player_relative", "unit_type", "selected", "build_progress"}
+        self.minimap_active_layers = {"player_relative", "selected"}
+
+
 # 地图配置映射表
 AVAILABLE_MAPS = {
     "MoveToBeacon": MoveToBeaconConfig,
+    "DefeatRoaches": DefeatRoachesConfig,
+    "CollectMineralsAndGas": CollectMineralsAndGasConfig,
+    "BuildMarines": BuildMarinesConfig,
 }
 
 
