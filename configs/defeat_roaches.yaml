@@ -1,0 +1,55 @@
+# DefeatRoaches 云端正式训练配置：持续训练模式（total_timesteps: -1）。
+# 用法: TRAIN_CONFIG_PATH=configs/defeat_roaches.yaml python train.py
+# 启动前: python tools/bitahub_preflight.py --config configs/defeat_roaches.yaml
+
+env: DefeatRoaches
+out_dir: ./models/defeat_roaches
+checkpoint_path:
+
+n_envs: 16
+seed: 0
+device: auto             # CUDA 可用时使用 GPU，否则回退 CPU；也可写 cpu / cuda / cuda:0
+vec_env_cls: subproc     # 向量化环境类型: "dummy" (单进程串行) 或 "subproc" (多进程并行)
+
+policy: MaskedFlattenPolicy
+policy_kwargs:
+  features_extractor_kwargs:
+    cnn_output_dim: 256
+
+env_kwargs:
+  screen_size: 32
+  minimap_size: 32
+  step_mul: 8
+  visualize: false
+  reset_jitter_max_steps: 15
+
+# 不固定步数：设置 <=0 表示持续训练，直到手动中断（Ctrl+C / SIGINT）。
+# 中断时 train.py 会正常保存 final_model 并关闭所有 SC2 进程。
+# 16 环境实测约 273 env-steps/s。
+total_timesteps: -1
+
+learning_rate: 3e-4       # PPO 常用值（SB3 默认 3e-4）；7e-4 更适合 A2C+RMSProp
+ent_coef: 0.001           # 与 pysc2-rl-agents 的 entropy_weight=1e-3 对齐
+batch_size: 128           # rollout = n_envs*n_steps = 256，每次 epoch 2 个 minibatch
+n_epochs: 4
+gamma: 0.99
+gae_lambda: 0.95
+n_steps: 32               # rollout 256，避免 128 条样本就更新一次
+clip_range: 0.2
+vf_coef: 0.5
+max_grad_norm: 0.5
+clip_value_loss: false
+
+save_iters: 1000         # 1 个 opt-step = 16*32 = 512 env-steps；约每 51 万步保存一次（约 630MB 峰值）
+summary_iters: 10
+eval_every: 250          # 250 opt-steps = 128000 env-steps 评估一次，约 8 分钟一次
+n_eval_episodes: 10      # 单局分数是 0-3 的小整数，5 局均值噪声过大
+eval_deterministic: true # 评估走确定性策略，曲线可比
+eval_render: false
+
+tensorboard: true
+tb_log_dir: tb_logs
+log_interval: 1
+
+save_best_model: true
+verbose: 1

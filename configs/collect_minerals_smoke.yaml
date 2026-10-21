@@ -1,0 +1,50 @@
+# CollectMineralsAndGas smoke test：快速验证训练流程（约 5 分钟）
+# 用法: TRAIN_CONFIG_PATH=configs/collect_minerals_smoke.yaml python train.py
+# 启动前: python tools/bitahub_preflight.py --config configs/collect_minerals_smoke.yaml
+
+env: CollectMineralsAndGas
+out_dir: ./models/collect_minerals_smoke
+
+n_envs: 8
+vec_env_cls: subproc     # 必填，无代码默认值：多进程并行采样
+seed: 0
+device: auto
+
+policy: MaskedFlattenPolicy
+policy_kwargs:
+  features_extractor_kwargs:
+    cnn_output_dim: 256
+
+env_kwargs:
+  screen_size: 32
+  minimap_size: 32
+  step_mul: 8
+  visualize: false
+  reset_jitter_max_steps: 15
+
+total_timesteps: 10000   # 1 万步快速验证
+
+learning_rate: 7e-4
+ent_coef: 0.001
+batch_size: 128
+n_epochs: 4
+gamma: 0.99
+gae_lambda: 0.95
+n_steps: 16
+clip_range: 0.2
+vf_coef: 0.5
+max_grad_norm: 0.5
+
+save_iters: 50
+summary_iters: 10
+eval_every: 20
+n_eval_episodes: 3
+eval_deterministic: false
+eval_render: false
+
+tensorboard: true
+tb_log_dir: tb_logs
+log_interval: 1
+
+save_best_model: true
+verbose: 1
