@@ -1,4 +1,4 @@
-# BuildMarines smoke test：快速验证训练流程（约 5 分钟）
+# BuildMarines smoke test：快速验证训练流程（约 3 分钟，含一次初始评估）
 # 用法: TRAIN_CONFIG_PATH=configs/build_marines_smoke.yaml python train.py
 # 启动前: python tools/bitahub_preflight.py --config configs/build_marines_smoke.yaml
 
@@ -18,18 +18,18 @@ policy_kwargs:
 env_kwargs:
   screen_size: 32
   minimap_size: 32
-  step_mul: 8
+  step_mul: 24            # 与正式配置一致：约 600 steps/局
   visualize: false
-  reset_jitter_max_steps: 15
+  reset_jitter_max_steps: 0
 
 total_timesteps: 10000   # 1 万步快速验证
 
-learning_rate: 7e-4
-ent_coef: 0.001
+learning_rate: 3e-4
+ent_coef: 0.005
 batch_size: 128
 n_epochs: 4
-gamma: 0.99
-gae_lambda: 0.95
+gamma: 0.997
+gae_lambda: 0.98
 n_steps: 16
 clip_range: 0.2
 vf_coef: 0.5
@@ -37,8 +37,8 @@ max_grad_norm: 0.5
 
 save_iters: 50
 summary_iters: 10
-eval_every: 20
-n_eval_episodes: 3
+eval_every: 100          # 10k 预算内只用训练起始那次评估验证 eval 链路
+n_eval_episodes: 2       # 单局 600 步，2 局已足够验证；避免评估盖过训练
 eval_deterministic: false
 eval_render: false
 

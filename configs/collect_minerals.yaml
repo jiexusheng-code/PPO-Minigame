@@ -1,6 +1,12 @@
-# CollectMineralsAndGas 云端正式训练配置：持续训练模式（total_timesteps: -1）。
+# CollectMineralsAndGas 正式训练配置（基线）：持续训练，人工中断（total_timesteps: -1）。
 # 用法: TRAIN_CONFIG_PATH=configs/collect_minerals.yaml python train.py
 # 启动前: python tools/bitahub_preflight.py --config configs/collect_minerals.yaml
+#
+# 地图特性：地图时间上限 420s；step_mul=8 时实测 episode = 840 agent steps，
+# 本配置改用 step_mul=16 -> 约 420 steps/局，缩短信用分配跨度。
+# 实测（16 envs / subproc / RTX 4090，关闭评估）：约 255 env-steps/s。
+# 奖励 = score 差分（采集到的资源），12 个 SCV 初始 idle：随机策略跑完整局 reward 仍为 0，
+# 必须先学到 select -> harvest 的组合。本轮只作为基线，不追求收敛速度。
 
 env: CollectMineralsAndGas
 out_dir: ./models/collect_minerals
@@ -9,7 +15,7 @@ checkpoint_path:
 n_envs: 16
 seed: 0
 device: auto             # CUDA 可用时使用 GPU，否则回退 CPU；也可写 cpu / cuda / cuda:0
-vec_env_cls: subproc     # 向量化环境类型: "dummy" (单进程串行) 或 "subproc" (多进程并行)
+vec_env_cls: subproc     # 必填，无代码默认值：dummy 单进程串行 / subproc 多进程并行
 
 policy: MaskedFlattenPolicy
 policy_kwargs:
@@ -19,37 +25,38 @@ policy_kwargs:
 env_kwargs:
   screen_size: 32
   minimap_size: 32
-  step_mul: 8
+  step_mul: 16            # 经济操作不需要逐帧精度；回合 840 -> 420 步
   visualize: false
-  reset_jitter_max_steps: 15
+  reset_jitter_max_steps: 0  # 开局 15 个 no_op 对 420 步的经济局是纯浪费
 
 # 不固定步数：设置 <=0 表示持续训练，直到手动中断（Ctrl+C / SIGINT）。
 # 中断时 train.py 会正常保存 final_model 并关闭所有 SC2 进程。
-# 16 环境实测约 273 env-steps/s。
 total_timesteps: -1
 
-learning_rate: 3e-4       # PPO 常用值（SB3 默认 3e-4）；7e-4 更适合 A2C+RMSProp
-ent_coef: 0.001           # 与 pysc2-rl-agents 的 entropy_weight=1e-3 对齐
-batch_size: 128           # rollout = n_envs*n_steps = 256，每次 epoch 2 个 minibatch
+# rollout = n_envs * n_steps = 16 * 64 = 1024；batch 256 -> 每个 epoch 4 个 minibatch
+learning_rate: 3e-4
+ent_coef: 0.005           # 比 MoveToBeacon 略高：初始阶段几乎无奖励，鼓励探索
+batch_size: 256
 n_epochs: 4
-gamma: 0.99
-gae_lambda: 0.95
-n_steps: 32               # rollout 256，避免 128 条样本就更新一次
+gamma: 0.995              # 奖励以采矿往返为单位出现，需要更长的折扣视野
+gae_lambda: 0.97          # GAE 有效视野约 1/(1-gamma*lambda) ≈ 29 步
+n_steps: 64
 clip_range: 0.2
 vf_coef: 0.5
 max_grad_norm: 0.5
 clip_value_loss: false
 
-save_iters: 1000         # 1 个 opt-step = 16*32 = 512 env-steps；约每 51 万步保存一次（约 630MB 峰值）
+# 1 optimization-step = n_envs * n_steps = 1024 env-steps
+save_iters: 500           # 约每 51 万 env-steps 保存一次（单模型约 33MB）
 summary_iters: 10
-eval_every: 250          # 250 opt-steps = 128000 env-steps 评估一次，约 8 分钟一次
-n_eval_episodes: 10      # 单局分数是 0-3 的小整数，5 局均值噪声过大
-eval_deterministic: true # 评估走确定性策略，曲线可比
+eval_every: 50            # 50 opt-steps = 3200 VecEnv steps = 51200 env-steps
+n_eval_episodes: 5        # 单局 420 步；5 局约占采样量 4%
+eval_deterministic: true
 eval_render: false
 
 tensorboard: true
 tb_log_dir: tb_logs
 log_interval: 1
 
-save_best_model: true
+save_best_model: true     # 发现更优模型时清理周期 checkpoint，只保留最佳/最终模型
 verbose: 1
