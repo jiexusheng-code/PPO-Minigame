@@ -11,7 +11,7 @@ from pysc2.lib import features
 class PySC2GymEnv(gym.Env):
     """Generic PySC2 wrapper compatible with Gymnasium."""
 
-    metadata = {"render.modes": ["human"]}
+    metadata = {"render_modes": ["human"]}
 
     def __init__(
         self,
@@ -121,14 +121,18 @@ class PySC2GymEnv(gym.Env):
                     'param_semantics': self._param_semantics,
                     'param_size_dict': self._param_size_dict,
                 }
-                out_dir = os.environ.get('TRAIN_OUT_DIR', None)
-                if out_dir is None:
-                    out_dir = os.path.join(os.getcwd(), 'models')
-                os.makedirs(out_dir, exist_ok=True)
-                path = os.path.join(out_dir, 'param_semantics_env.json')
-                with open(path, 'w', encoding='utf-8') as f:
-                    json.dump(snapshot, f, ensure_ascii=False, indent=2)
-                self.logger.info(f"Wrote param semantics snapshot to {path}")
+                # Parallel envs all share TRAIN_OUT_DIR; only rank 0 may write,
+                # otherwise concurrent workers race on the same file.
+                rank = int(os.environ.get('VEC_ENV_RANK', 0))
+                if rank == 0:
+                    out_dir = os.environ.get('TRAIN_OUT_DIR', None)
+                    if out_dir is None:
+                        out_dir = os.path.join(os.getcwd(), 'models')
+                    os.makedirs(out_dir, exist_ok=True)
+                    path = os.path.join(out_dir, 'param_semantics_env.json')
+                    with open(path, 'w', encoding='utf-8') as f:
+                        json.dump(snapshot, f, ensure_ascii=False, indent=2)
+                    self.logger.info(f"Wrote param semantics snapshot to {path}")
             except Exception:
                 pass
         except Exception as e:
@@ -402,7 +406,11 @@ class PySC2GymEnv(gym.Env):
         self.logger.debug(f"  Available actions: {len(available)}, reward={reward:.3f}, terminated={terminated}, clipped={clipped}")
         return obs, reward, terminated, truncated, info
 
-    def render(self, mode="human"):
+    def render(self):
+        """Render method for Gymnasium API compatibility.
+
+        Returns None as rendering is handled by PySC2's visualize flag.
+        """
         return None
 
     def close(self):

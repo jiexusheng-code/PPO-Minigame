@@ -83,12 +83,17 @@ def test_make_seeded_vec_env_passes_seed_plus_rank_to_constructor(monkeypatch):
 
     monkeypatch.setattr(train, "make_env_fn", fake_make_env_fn)
 
-    vec_env = train.make_seeded_vec_env("MoveToBeacon", {}, 3, seed=10)
+    # DummyVecEnv keeps envs in-process so the recorded constructor seeds and
+    # the VecEnv seed list are observable here.
+    vec_env = train.make_seeded_vec_env(
+        "MoveToBeacon", {}, 3, seed=10, vec_env_cls="dummy"
+    )
     assert created == [10, 11, 12]
     assert vec_env._seeds == [10, 11, 12]
 
     eval_env = train.make_seeded_vec_env(
-        "MoveToBeacon", {}, 2, seed=10, offset=EVAL_SEED_OFFSET
+        "MoveToBeacon", {}, 2, seed=10, offset=EVAL_SEED_OFFSET,
+        vec_env_cls="dummy",
     )
     assert created[-2:] == [110, 111]
     assert eval_env._seeds == [110, 111]

@@ -7,7 +7,7 @@ import yaml
 import logging
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import EvalCallback, CallbackList, BaseCallback
-from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 from stable_baselines3.common.monitor import Monitor
 from src.policies.masked_flatten_policy import MaskedFlattenPolicy, VectorLayerNormExtractor
 from src.callbacks.tb_dual_writer import TBDualWriterCallback
@@ -158,32 +158,53 @@ def make_env_fn(map_name: str, env_kwargs=None, random_seed=None):
     return _init
 
 
-def make_seeded_vec_env(map_name: str, env_kwargs, n_envs, seed, offset=0):
-    """Build a DummyVecEnv whose env ``rank`` gets ``seed + offset + rank``.
+def make_seeded_vec_env(map_name: str, env_kwargs, n_envs, seed, offset=0, vec_env_cls="subproc"):
+    """Build a vectorized environment whose env ``rank`` gets ``seed + offset + rank``.
 
     This mirrors SB3's ``make_vec_env`` (seed + rank) but also passes the same
     deterministic seed to the environment constructor, so PySC2 receives a
     ``random_seed`` before the construction-time probe reset. Resets are seeded
     through the regular ``VecEnv.seed`` path as well.
+
+    Args:
+        map_name: SC2 map name
+        env_kwargs: environment keyword arguments
+        n_envs: number of parallel environments
+        seed: base seed for seeding
+        offset: seed offset for evaluation environments
+        vec_env_cls: "dummy" for DummyVecEnv (single-process, serial),
+                     "subproc" for SubprocVecEnv (multi-process, parallel)
     """
     n_envs = int(n_envs)
     if n_envs < 1:
         raise ValueError(f"n_envs must be >= 1, got {n_envs}")
+
+    vec_env_cls_str = str(vec_env_cls).strip().lower()
+    if vec_env_cls_str not in ("dummy", "subproc"):
+        raise ValueError(f"vec_env_cls must be 'dummy' or 'subproc', got {vec_env_cls!r}")
 
     env_fns = []
     for rank in range(n_envs):
         env_seed = compute_env_seed(seed, rank, offset)
         factory = make_env_fn(map_name, env_kwargs, random_seed=env_seed)
 
-        def _init(factory=factory, env_seed=env_seed):
+        def _init(factory=factory, env_seed=env_seed, rank=rank):
+            # SubprocVecEnv runs each env_fn in its own process; expose the rank
+            # so PySC2GymEnv lets only rank 0 write shared output files.
+            os.environ['VEC_ENV_RANK'] = str(rank)
             env = factory()
             env.action_space.seed(env_seed)
             return Monitor(env)
 
         env_fns.append(_init)
 
-    vec_env = DummyVecEnv(env_fns)
-    # DummyVecEnv.seed sets _seeds = [seed + i], delivered to reset() once.
+    if vec_env_cls_str == "dummy":
+        vec_env = DummyVecEnv(env_fns)
+    else:  # subproc
+        vec_env = SubprocVecEnv(env_fns, start_method='spawn')
+
+    # VecEnv.seed delivers seed + rank to each env's reset() once
+    # (DummyVecEnv stores it in _seeds; SubprocVecEnv forwards it per worker).
     vec_env.seed(compute_env_seed(seed, 0, offset))
     return vec_env
 
@@ -378,6 +399,8 @@ def main():
     base_dir = os.path.join(out_dir_root, today_str)
     out_dir = base_dir
     n_envs = require("n_envs")
+    # Optional: "subproc" (default, multi-process) or "dummy" (single-process).
+    vec_env_cls = cfg.get("vec_env_cls", "subproc")
     seed = require("seed")
     total_timesteps = require("total_timesteps")
     policy_cfg = require("policy")
@@ -446,7 +469,10 @@ def main():
     vec_env = None
     eval_env = None
     try:
-        vec_env = make_seeded_vec_env(env_name, env_kwargs, n_envs, seed)
+        vec_env = make_seeded_vec_env(
+            env_name, env_kwargs, n_envs, seed, vec_env_cls=vec_env_cls
+        )
+        logger.info(f"训练环境 VecEnv 类型: {vec_env_cls}")
         logger.info(
             f"训练环境 seed: {compute_env_seed(seed, 0)}..{compute_env_seed(seed, int(n_envs) - 1)} "
             f"(seed={seed}, n_envs={n_envs})"
@@ -499,8 +525,8 @@ def main():
                 # are available early (useful for short smoke-runs)
                 try:
                     super()._on_training_start()
-                except Exception:
-                    pass
+                except Exception as e:
+                    self._logger.warning(f"[EvalCallback] 父类初始化失败: {type(e).__name__}: {e}")
                 saved_n_calls = self.n_calls
                 try:
                     # call EvalCallback's evaluation routine directly once
@@ -514,10 +540,10 @@ def main():
                         # this will call the internal evaluation logic and populate
                         # `last_mean_reward` / `evaluations_length` etc.
                         self._on_step()
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
+                    except Exception as e:
+                        self._logger.warning(f"[EvalCallback] 初始评估失败: {type(e).__name__}: {e}")
+                except Exception as e:
+                    self._logger.warning(f"[EvalCallback] 初始评估设置失败: {type(e).__name__}: {e}")
                 finally:
                     self.n_calls = saved_n_calls
 
@@ -544,11 +570,11 @@ def main():
                         try:
                             if getattr(self, 'evaluations_length', None) is not None and len(self.evaluations_length) > 0:
                                 eval_stats["mean_ep_length"] = float(self.evaluations_length[-1].mean())
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            self._logger.warning(f"[EvalCallback] 评估长度聚合失败: {type(e).__name__}: {e}")
                         setattr(self.model, '_last_eval_stats', eval_stats)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        self._logger.warning(f"[EvalCallback] 评估统计聚合失败: {type(e).__name__}: {e}")
                     # if configured to keep only best, and a new best was found, remove periodic checkpoints
                     try:
                         new_best = getattr(self, 'best_mean_reward', float('-inf'))
@@ -558,10 +584,10 @@ def main():
                             for path in glob.glob(pattern):
                                 try:
                                     os.remove(path)
-                                except Exception:
-                                    pass
-                    except Exception:
-                        pass
+                                except Exception as e:
+                                    self._logger.warning(f"[EvalCallback] 删除检查点失败: {path}: {type(e).__name__}: {e}")
+                    except Exception as e:
+                        self._logger.warning(f"[EvalCallback] 清理检查点失败: {type(e).__name__}: {e}")
                 return result
 
         eval_callback = None
@@ -571,7 +597,8 @@ def main():
                 eval_freq,
                 logger=logger,
                 make_env=lambda: make_seeded_vec_env(
-                    env_name, env_kwargs, 1, seed, offset=eval_seed_offset
+                    env_name, env_kwargs, 1, seed, offset=eval_seed_offset,
+                    vec_env_cls="dummy",
                 ),
                 build_callback=lambda env: LogEvalCallback(
                     env,
