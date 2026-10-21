@@ -24,6 +24,8 @@ PASS, WARN, FAIL, SKIP = "PASS", "WARN", "FAIL", "SKIP"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = REPO_ROOT / "configs" / "bitahub_first_run.yaml"
 
+SUPPORTED_MAPS = ["MoveToBeacon", "DefeatRoaches", "CollectMineralsAndGas", "BuildMarines"]
+
 # Keys read with require() in train.py. checkpoint_path is optional there.
 REQUIRED_KEYS = [
     "env", "out_dir", "n_envs", "vec_env_cls", "seed", "device", "policy", "policy_kwargs", "env_kwargs",
@@ -124,7 +126,7 @@ def check_nvidia_smi(rep):
         rep.warn("nvidia-smi", (result.stderr or "无输出").strip())
 
 
-def check_sc2(rep):
+def check_sc2(rep, map_name="MoveToBeacon"):
     env_path = os.environ.get("SC2PATH")
     if env_path:
         sc2path = Path(env_path).expanduser()
@@ -166,15 +168,15 @@ def check_sc2(rep):
     map_candidates = []
     for maps_dir in ("Maps", "maps"):
         for sub_dir in ("mini_games", ""):
-            candidate = sc2path / maps_dir / sub_dir / "MoveToBeacon.SC2Map"
+            candidate = sc2path / maps_dir / sub_dir / f"{map_name}.SC2Map"
             if candidate not in map_candidates:
                 map_candidates.append(candidate)
     map_path = next((path for path in map_candidates if path.is_file()), None)
     if map_path is not None:
-        rep.ok("MoveToBeacon 地图", str(map_path))
+        rep.ok(f"{map_name} 地图", str(map_path))
     else:
         checked = "; ".join(str(path) for path in map_candidates)
-        rep.fail("MoveToBeacon 地图", f"未找到；已检查: {checked}")
+        rep.fail(f"{map_name} 地图", f"未找到；已检查: {checked}")
 
 
 def check_display(rep):
@@ -294,7 +296,7 @@ def check_device_config(rep, cfg, torch):
     rep.fail("device", f"不支持 {raw!r}；应为 auto / cpu / cuda / cuda:<index>")
 
 
-def check_config(rep, config_path, torch=None):
+def check_config(rep, config_path, torch=None, map_name="MoveToBeacon"):
     path = Path(config_path).expanduser()
     if not path.is_file():
         rep.fail("配置文件", f"不存在: {path}")
@@ -318,6 +320,15 @@ def check_config(rep, config_path, torch=None):
         rep.ok("配置必要键", f"{len(REQUIRED_KEYS)} 项齐全")
     if "eval_freq" in cfg:
         rep.fail("legacy key eval_freq", "train.py 会拒绝该键，请使用 eval_every")
+
+    env_name = cfg.get("env")
+    if env_name is None:
+        # Already reported by the missing-required-keys check above.
+        pass
+    elif env_name not in SUPPORTED_MAPS:
+        rep.fail("env", f"不支持 {env_name!r}；支持: {', '.join(SUPPORTED_MAPS)}")
+    else:
+        rep.ok("env", f"{env_name}（地图检查: {map_name}.SC2Map）")
 
     total_timesteps = cfg.get("total_timesteps")
     if isinstance(total_timesteps, bool) or not isinstance(total_timesteps, int):
@@ -364,12 +375,30 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 
+def read_config_map_name(rep, config_path):
+    """Read `env` from the config for the SC2 map check, falling back on failure."""
+    path = Path(config_path).expanduser()
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            cfg = yaml.safe_load(handle)
+        env_name = cfg.get("env") if isinstance(cfg, dict) else None
+    except Exception as exc:
+        rep.warn("env", f"无法从配置读取 env: {type(exc).__name__}: {exc}；回退 MoveToBeacon")
+        return "MoveToBeacon"
+    if not env_name:
+        rep.warn("env", "配置未提供 env；回退 MoveToBeacon")
+        return "MoveToBeacon"
+    return str(env_name)
+
+
 def main(argv=None):
     args = parse_args(argv)
     rep = Report()
     print("== Bitahub preflight ==")
     print(f"配置: {args.config}")
     print()
+
+    map_name = read_config_map_name(rep, args.config)
 
     check_python(rep)
     torch = check_import(rep, "torch")
@@ -380,9 +409,9 @@ def main(argv=None):
     check_import(rep, "tensorboard")
     check_cuda(rep, torch)
     check_nvidia_smi(rep)
-    check_sc2(rep)
+    check_sc2(rep, map_name)
     check_display(rep)
-    check_config(rep, args.config, torch)
+    check_config(rep, args.config, torch, map_name)
 
     print()
     print(f"结果: {len(rep.fails)} FAIL, {len(rep.warns)} WARN")
