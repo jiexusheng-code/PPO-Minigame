@@ -9,6 +9,7 @@ checkpoint_path:
 n_envs: 8
 seed: 0
 device: auto             # CUDA 可用时使用 GPU，否则回退 CPU；也可写 cpu / cuda / cuda:0
+vec_env_cls: subproc     # 向量化环境类型: "dummy" (单进程串行) 或 "subproc" (多进程并行)
 
 policy: MaskedFlattenPolicy
 policy_kwargs:
@@ -37,10 +38,10 @@ vf_coef: 0.5
 max_grad_norm: 0.5
 clip_value_loss: false
 
-save_iters: 200          # 1M 步约 39 次周期保存
+save_iters: 500          # 1M 步约 16 次周期保存，减少磁盘占用（约 520MB vs 1.3GB）
 summary_iters: 10
-eval_every: 50           # 50 opt-steps = 6400 env-steps 评估一次
-n_eval_episodes: 10
+eval_every: 200          # 200 opt-steps = 25600 env-steps 评估一次，减少 4 倍评估开销（约 15 分钟 vs 1 小时）
+n_eval_episodes: 5       # 单次评估时间减半，保持足够统计性
 eval_deterministic: false
 eval_render: false
 

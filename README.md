@@ -2,7 +2,11 @@
 
 基于 PySC2 与 Stable-Baselines3 PPO 的《星际争霸 II》minigame 强化学习项目。当前目标是先把 MoveToBeacon 等小任务训练跑通并验证学习效果，再逐步扩展到更复杂的 minigame。
 
-> 状态：仓库仍处于开发与验证阶段，尚未完成正式训练或基准结论。
+> **项目状态**：
+> - ✅ 本地验证完成（smoke test 通过）
+> - ✅ 云端环境配置就绪
+> - ⏳ 等待首次 1M 步实验执行
+> - 尚无正式基准结论
 
 ## 技术栈
 
@@ -58,6 +62,30 @@ uv run pytest -q
 
 运行前还需自行准备 StarCraft II 客户端及 PySC2 所需地图。
 
+## 云端环境配置
+
+在 Bitahub 或其他云端环境首次使用时，需要配置环境变量：
+
+```bash
+# 方式 1：每次会话手动设置
+export SC2PATH=/mnt/ppo/StarCraftII
+export DISPLAY=:99
+
+# 方式 2：使用项目提供的环境脚本（推荐）
+source scripts/env.sh
+
+# 方式 3：写入 ~/.bashrc（永久生效）
+echo 'export SC2PATH=/mnt/ppo/StarCraftII' >> ~/.bashrc
+echo 'export DISPLAY=:99' >> ~/.bashrc
+source ~/.bashrc
+```
+
+配置完成后，运行 preflight 检查：
+
+```bash
+python tools/bitahub_preflight.py --config configs/bitahub_first_run.yaml
+```
+
 ## 计算设备
 
 配置项 `device` 默认 `auto`：CUDA 可用时优先使用 GPU，否则回退 CPU。也可显式写 `cpu`、`cuda` 或 `cuda:0`；显式指定 CUDA 但不可用时会直接报错，避免在 GPU 机器上静默用 CPU 长时间训练。
@@ -91,6 +119,29 @@ $env:TRAIN_CONFIG_PATH="configs/bitahub_first_run.yaml"; uv run python train.py
 ```
 
 `configs/bitahub_first_run.yaml` 固定为 1,000,000 步，用于首次云端验证，不是正式基准实验。
+
+## 性能优化配置
+
+### 并行环境
+
+- `vec_env_cls: "subproc"`：使用多进程并行环境，充分利用多核 CPU（推荐用于正式训练）
+- `vec_env_cls: "dummy"`：单进程串行环境，便于调试和排查问题
+
+### 评估频率
+
+`eval_every` 控制评估间隔（单位：训练步数）：
+
+- 较小值（如 10000）：更频繁评估，曲线更平滑，但会增加训练时间
+- 较大值（如 50000）：减少评估开销，加快训练，但曲线粒度粗
+
+### Checkpoint 策略
+
+`save_iters` 控制模型保存频率（单位：训练步数）：
+
+- 较小值：更频繁保存，便于回滚，但占用更多磁盘空间
+- 较大值：减少磁盘占用，但回滚粒度粗
+
+建议首次实验使用默认配置，待稳定后根据实际需求调整。
 
 ## 职责边界
 
