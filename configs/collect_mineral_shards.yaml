@@ -1,0 +1,61 @@
+# CollectMineralShards 正式训练配置（基线）：持续训练，人工中断（total_timesteps: -1）。
+# 用法: TRAIN_CONFIG_PATH=configs/collect_mineral_shards.yaml python train.py
+# 启动前: python tools/bitahub_preflight.py --config configs/collect_mineral_shards.yaml
+#
+# 地图时间上限 120s；实际观察到 step_mul=8 时每局约 240 个 agent steps。
+# 控制两名陆战队员收集地图上的晶体矿碎片，每拾取一个碎片即时 +1 分。
+# 奖励即时、回合短，且寻路/移动精度直接影响得分，因此保留 step_mul=8。
+# 随机策略偶尔也能碰到碎片，不需要很高的熵系数；本轮只作为基线。
+
+env: CollectMineralShards
+out_dir: ./models/collect_mineral_shards
+checkpoint_path:
+
+n_envs: 16
+seed: 0
+device: auto             # CUDA 可用时使用 GPU，否则回退 CPU；也可写 cpu / cuda / cuda:0
+vec_env_cls: subproc     # 必填，无代码默认值：dummy 单进程串行 / subproc 多进程并行
+
+policy: MaskedFlattenPolicy
+policy_kwargs:
+  features_extractor_kwargs:
+    cnn_output_dim: 256
+
+env_kwargs:
+  screen_size: 32
+  minimap_size: 32
+  step_mul: 8             # 120s 上限 -> 实际约 240 steps/局；移动/寻路需要细粒度
+  visualize: false
+  reset_jitter_max_steps: 0  # 开局 no_op 对约 240 步的收集局是纯浪费
+
+# 不固定步数：设置 <=0 表示持续训练，直到手动中断（Ctrl+C / SIGINT）。
+# 中断时 train.py 会正常保存 final_model 并关闭所有 SC2 进程。
+total_timesteps: -1
+
+# rollout = n_envs * n_steps = 16 * 64 = 1024；batch 256 -> 每个 epoch 4 个 minibatch
+learning_rate: 3e-4
+ent_coef: 0.001           # 每拾取一个碎片即时给分，探索压力小，保持低熵系数
+batch_size: 256
+n_epochs: 4
+gamma: 0.99               # 回合约 240 步且奖励即时，0.99 已覆盖一次寻路
+gae_lambda: 0.95
+n_steps: 64
+clip_range: 0.2
+vf_coef: 0.5
+max_grad_norm: 0.5
+clip_value_loss: false
+
+# 1 optimization-step = n_envs * n_steps = 1024 env-steps
+save_iters: 500           # 约每 51 万 env-steps 保存一次（单模型约 33MB）
+summary_iters: 10
+eval_every: 50            # 50 opt-steps = 3200 VecEnv steps = 51200 env-steps
+n_eval_episodes: 5        # 单局约 240 步；5 局约占评估间隔采样量的 2.3%
+eval_deterministic: false # 按策略分布采样，与项目当前评估标准一致
+eval_render: false
+
+tensorboard: true
+tb_log_dir: tb_logs
+log_interval: 1
+
+save_best_model: true     # 发现更优模型时清理周期 checkpoint，只保留最佳/最终模型
+verbose: 1

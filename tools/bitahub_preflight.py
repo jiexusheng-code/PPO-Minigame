@@ -24,7 +24,7 @@ PASS, WARN, FAIL, SKIP = "PASS", "WARN", "FAIL", "SKIP"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = REPO_ROOT / "configs" / "bitahub_first_run.yaml"
 
-SUPPORTED_MAPS = ["MoveToBeacon", "DefeatRoaches", "CollectMineralsAndGas", "BuildMarines"]
+SUPPORTED_MAPS = ["MoveToBeacon", "DefeatRoaches", "CollectMineralsAndGas", "BuildMarines", "CollectMineralShards"]
 
 # Keys read with require() in train.py. checkpoint_path is optional there.
 REQUIRED_KEYS = [

@@ -14,6 +14,13 @@ sys.path.insert(0, REPO_ROOT)
 from train import REQUIRED_CONFIG_KEYS, compute_eval_freq
 
 BITAHUB_CONFIG = os.path.join(REPO_ROOT, "configs", "bitahub_first_run.yaml")
+COLLECT_MINERAL_SHARDS_CONFIGS = [
+    os.path.join(REPO_ROOT, "configs", name)
+    for name in (
+        "collect_mineral_shards.yaml",
+        "collect_mineral_shards_smoke.yaml",
+    )
+]
 
 
 def _load_tool(name):
@@ -38,6 +45,30 @@ def test_preflight_accepts_bitahub_config():
     rep = preflight.Report()
     preflight.check_config(rep, BITAHUB_CONFIG)
     assert not rep.fails, rep.fails
+
+
+def test_preflight_supports_collect_mineral_shards():
+    assert "CollectMineralShards" in preflight.SUPPORTED_MAPS
+
+
+@pytest.mark.parametrize("config_path", COLLECT_MINERAL_SHARDS_CONFIGS)
+def test_preflight_accepts_collect_mineral_shards_configs(config_path):
+    rep = preflight.Report()
+    preflight.check_config(rep, config_path)
+    assert not rep.fails, rep.fails
+
+
+@pytest.mark.parametrize("config_path", COLLECT_MINERAL_SHARDS_CONFIGS)
+def test_collect_mineral_shards_configs_use_stochastic_eval(config_path):
+    with open(config_path, "r", encoding="utf-8") as handle:
+        cfg = yaml.safe_load(handle)
+    assert cfg["env"] == "CollectMineralShards"
+    assert cfg["eval_deterministic"] is False
+    if config_path.endswith("_smoke.yaml"):
+        assert cfg["n_envs"] == 1
+        assert cfg["vec_env_cls"] == "dummy"
+        assert cfg["total_timesteps"] == 256
+        assert cfg["eval_every"] == 0
 
 
 def _bitahub_cfg(**overrides):

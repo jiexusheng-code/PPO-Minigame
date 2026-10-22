@@ -44,7 +44,7 @@ save_iters: 1000         # 1 个 opt-step = 16*32 = 512 env-steps；约每 51 �
 summary_iters: 10
 eval_every: 250          # 250 opt-steps = 128000 env-steps 评估一次，约 8 分钟一次
 n_eval_episodes: 10      # 单局分数是 0-3 的小整数，5 局均值噪声过大
-eval_deterministic: true # 评估走确定性策略，曲线可比
+eval_deterministic: false # 评估按策略分布采样，作为主要成绩与选模依据
 eval_render: false
 
 tensorboard: true

@@ -51,7 +51,7 @@ save_iters: 500           # 约每 51 万 env-steps 保存一次（单模型约 
 summary_iters: 10
 eval_every: 50            # 50 opt-steps = 3200 VecEnv steps = 51200 env-steps
 n_eval_episodes: 5        # 单局 420 步；5 局约占采样量 4%
-eval_deterministic: true
+eval_deterministic: false
 eval_render: false
 
 tensorboard: true

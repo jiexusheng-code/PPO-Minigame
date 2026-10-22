@@ -88,6 +88,18 @@ class MoveToBeaconConfig(MapConfig):
         self.minimap_active_layers = {"player_relative", "selected"}
 
 
+class CollectMineralShardsConfig(MapConfig):
+    """CollectMineralShards 配置（移动+收集：区分己方陆战队员与中立碎片）"""
+
+    def __init__(self):
+        super().__init__("CollectMineralShards")
+
+        # 中立碎片与己方单位用 player_relative 即可区分；
+        # selected 帮助模型识别当前选中的陆战队员。
+        self.screen_active_layers = {"player_relative", "selected"}
+        self.minimap_active_layers = {"player_relative", "selected"}
+
+
 class DefeatRoachesConfig(MapConfig):
     """DefeatRoaches 配置（战斗：需要单位类型与血量）"""
 
@@ -121,6 +133,7 @@ class BuildMarinesConfig(MapConfig):
 # 地图配置映射表
 AVAILABLE_MAPS = {
     "MoveToBeacon": MoveToBeaconConfig,
+    "CollectMineralShards": CollectMineralShardsConfig,
     "DefeatRoaches": DefeatRoachesConfig,
     "CollectMineralsAndGas": CollectMineralsAndGasConfig,
     "BuildMarines": BuildMarinesConfig,

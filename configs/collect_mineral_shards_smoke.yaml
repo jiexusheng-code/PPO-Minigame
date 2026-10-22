@@ -1,0 +1,50 @@
+# CollectMineralShards smoke test：单环境验证地图启动、训练更新和保存关闭
+# 用法: TRAIN_CONFIG_PATH=configs/collect_mineral_shards_smoke.yaml python train.py
+# 启动前: python tools/bitahub_preflight.py --config configs/collect_mineral_shards_smoke.yaml
+
+env: CollectMineralShards
+out_dir: ./models/collect_mineral_shards_smoke
+
+n_envs: 1
+vec_env_cls: dummy     # 本地 smoke 只启动一个训练环境；评估时另启一个环境
+seed: 0
+device: auto
+
+policy: MaskedFlattenPolicy
+policy_kwargs:
+  features_extractor_kwargs:
+    cnn_output_dim: 256
+
+env_kwargs:
+  screen_size: 32
+  minimap_size: 32
+  step_mul: 8             # 与正式配置一致：实际约 240 steps/局
+  visualize: false
+  reset_jitter_max_steps: 0
+
+total_timesteps: 256      # 单环境短测试；仅验证训练生命周期，不评估学习效果
+
+learning_rate: 3e-4
+ent_coef: 0.001
+batch_size: 16
+n_epochs: 4
+gamma: 0.99
+gae_lambda: 0.95
+n_steps: 16
+clip_range: 0.2
+vf_coef: 0.5
+max_grad_norm: 0.5
+
+save_iters: 50
+summary_iters: 10
+eval_every: 0            # 关闭评估，避免 smoke 额外启动 SC2 环境
+n_eval_episodes: 1       # eval_every=0 时不启动评估
+eval_deterministic: false
+eval_render: false
+
+tensorboard: true
+tb_log_dir: tb_logs
+log_interval: 1
+
+save_best_model: true
+verbose: 1

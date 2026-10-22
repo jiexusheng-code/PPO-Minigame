@@ -62,7 +62,7 @@ summary_iters: 10           # TensorBoard summary 写入频率（以 optimizatio
 # 推荐：使用 optimization-step 为单位可与训练更新对齐（pysc2-rl-agents 的设计即如此）
 eval_every: 10              # 评估频率（optimization-step）。例如 10 表示每 10 次 rollout/update 评估一次。
 n_eval_episodes: 20        # 每次评估运行的 episode 数，用于计算平均回报。
-eval_deterministic: false  # 评估使用确定性策略（True）还是采样策略（False）。True 适合最终性能验证。
+eval_deterministic: false  # 评估从策略分布采样；确定性动作仅作为补充诊断。
 eval_render: false         # 在评估时是否打开渲染（通常设为 false，在离线训练环境中禁用以节省资源）。
 
 # ----------------- TensorBoard / 日志 -----------------
