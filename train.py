@@ -485,6 +485,7 @@ def main():
     logger.info(describe_device(device))
     vec_env = None
     eval_env = None
+    tb_callback = None
     try:
         vec_env = make_seeded_vec_env(
             env_name, env_kwargs, n_envs, seed, vec_env_cls=vec_env_cls
@@ -750,6 +751,11 @@ def main():
         # Always release SC2 processes; close errors must not mask a training
         # exception. Training output is intentionally left in place for the
         # caller (smoke_run.py) to remove.
+        if tb_callback is not None:
+            # SB3 skips on_training_end when learn() is interrupted, so make
+            # sure a partially sampled trajectory is closed and marked
+            # incomplete instead of looking like a completed episode.
+            tb_callback.close_incomplete_trajectory("training_interrupted")
         for env_label, env in (("eval_env", eval_env), ("vec_env", vec_env)):
             if env is None:
                 continue

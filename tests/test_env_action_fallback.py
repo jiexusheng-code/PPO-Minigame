@@ -47,7 +47,10 @@ class FakeParser:
     def parse(self, observation):
         mask = np.zeros(max(self.available) + 1, dtype=np.float32)
         mask[self.available] = 1.0
-        return {"available_actions": mask}
+        parsed = {"available_actions": mask}
+        if hasattr(self, "screen"):
+            parsed["screen"] = self.screen
+        return parsed
 
 
 class FakeSC2Env:
@@ -92,9 +95,10 @@ def make_env(*, available=(NO_OP_ID, POINT_FN_ID), reject_non_noop=False, fail_a
 
 def test_valid_action_executes_normally():
     env = make_env()
-    _, reward, terminated, truncated, info = env.step([POINT_FN_ID, 5])
+    _, reward, terminated, truncated, info = env.step([POINT_FN_ID, 6])
 
     assert env._env.calls[-1].fn_id == POINT_FN_ID
+    assert env._env.calls[-1].args == ([2, 1],)
     assert info["executed_fn_id"] == POINT_FN_ID
     assert info["arg_clipped"] is False
     assert info["fn_available"] is True
@@ -132,6 +136,168 @@ def test_low_level_step_rejection_falls_back_to_no_op():
     assert [call.fn_id for call in env._env.calls] == [POINT_FN_ID, NO_OP_ID]
     assert info["executed_fn_id"] == NO_OP_ID
     assert info["arg_clipped"] is True
+
+
+def test_collect_mineral_shards_info_is_scoped_and_distinguishes_action_stages():
+    generic = make_env()
+    _, _, _, _, generic_info = generic.step([POINT_FN_ID, 6])
+    assert not any(key.startswith("collect_mineral_shards/") for key in generic_info)
+
+    env = make_env()
+    env.map_name = "CollectMineralShards"
+    env._parser.screen = np.zeros((4, 4, 2), dtype=np.float32)
+    env._parser.screen[1:3, 1:3, 1] = 3
+    _, _, _, _, info = env.step([POINT_FN_ID, 6])
+
+    prefix = "collect_mineral_shards/"
+    assert info[prefix + "requested_fn_name"] == "select_point"
+    assert info[prefix + "requested_args"] == (("screen", 6),)
+    assert info[prefix + "sanitized_args"] == (("screen", (2, 1)),)
+    assert info[prefix + "executed_args"] == (("screen", (2, 1)),)
+    assert info[prefix + "fallback"] is False
+    assert info[prefix + "fallback_reason_code"] == "none"
+    assert info[prefix + "raster_neutral_component_count_estimate_before"] == 1
+    # Requested raw values stay explicitly flat; coordinates are decoded too.
+    assert info[prefix + "requested_screen_flat"] == 6
+    assert info[prefix + "requested_screen_x"] == 2
+    assert info[prefix + "requested_screen_y"] == 1
+    assert info[prefix + "sanitized_screen_x"] == 2
+    assert info[prefix + "sanitized_screen_y"] == 1
+    assert info[prefix + "executed_screen_x"] == 2
+    assert info[prefix + "executed_screen_y"] == 1
+    assert prefix + "raster_requested_target_to_neutral_component_distance_estimate_cells" in info
+    assert prefix + "raster_executed_target_to_neutral_component_distance_estimate_cells" in info
+
+
+def test_no_op_is_not_reported_as_a_fallback():
+    env = make_env()
+    env.map_name = "CollectMineralShards"
+    env._parser.screen = np.zeros((4, 4, 2), dtype=np.float32)
+    _, _, _, _, info = env.step([NO_OP_ID])
+
+    prefix = "collect_mineral_shards/"
+    assert info[prefix + "fallback"] is False
+    assert info[prefix + "sanitization_failed"] is False
+    assert info[prefix + "args_modified"] is False
+    assert info[prefix + "args_bounds_violation"] is False
+    assert info[prefix + "legacy_invalid_or_fallback"] is False
+    assert info[prefix + "fallback_reason_code"] == "none"
+    assert info[prefix + "executed_fn_name"] == "no_op"
+    # no_op did not execute the requested target, so no executed-target metric.
+    assert prefix + "raster_executed_target_to_neutral_component_distance_estimate_cells" not in info
+
+
+def test_failed_sanitization_uses_invalid_sanitized_sentinel():
+    env = make_env()
+    env.map_name = "CollectMineralShards"
+    env._parser.screen = np.zeros((4, 4, 2), dtype=np.float32)
+    _, _, _, _, info = env.step([POINT_FN_ID, 99])
+
+    prefix = "collect_mineral_shards/"
+    assert info[prefix + "sanitization_failed"] is True
+    assert info[prefix + "args_bounds_violation"] is True
+    assert info[prefix + "args_modified"] is False
+    assert info[prefix + "legacy_invalid_or_fallback"] is True
+    assert info[prefix + "sanitized_fn_id"] == -1
+    assert info[prefix + "sanitized_fn_name"] == "invalid"
+    assert info[prefix + "sanitized_args"] == ()
+    assert info[prefix + "fallback"] is True
+    assert info[prefix + "fallback_reason_code"] == "sanitize_failed"
+    assert info[prefix + "requested_fn_id"] == POINT_FN_ID
+    assert info[prefix + "executed_fn_name"] == "no_op"
+    # The raw requested index was out of range, so it has no decoded target.
+    assert prefix + "requested_screen_x" not in info
+    assert prefix + "raster_requested_target_to_neutral_component_distance_estimate_cells" not in info
+    assert prefix + "raster_executed_target_to_neutral_component_distance_estimate_cells" not in info
+
+    # An out-of-range function id also fails sanitization and must not be
+    # reported as a valid sanitized function.
+    invalid_fn = make_env()
+    invalid_fn.map_name = "CollectMineralShards"
+    invalid_fn._parser.screen = np.zeros((4, 4, 2), dtype=np.float32)
+    _, _, _, _, info = invalid_fn.step([99, 0])
+
+    assert info[prefix + "requested_fn_id"] == 99
+    assert info[prefix + "requested_fn_name"] == "invalid"
+    assert info[prefix + "sanitization_failed"] is True
+    assert info[prefix + "args_bounds_violation"] is False
+    assert info[prefix + "legacy_invalid_or_fallback"] is True
+    assert info[prefix + "sanitized_fn_id"] == -1
+    assert info[prefix + "sanitized_fn_name"] == "invalid"
+    assert info[prefix + "sanitized_args"] == ()
+    assert info[prefix + "fallback_reason_code"] == "sanitize_failed"
+    assert info[prefix + "executed_fn_name"] == "no_op"
+
+
+def test_unavailable_and_low_level_failures_report_reason_codes_and_scalars():
+    unavailable = make_env(available=(NO_OP_ID,), reject_non_noop=True)
+    unavailable.map_name = "CollectMineralShards"
+    unavailable._parser.screen = np.zeros((4, 4, 2), dtype=np.float32)
+    _, _, _, _, info = unavailable.step([POINT_FN_ID, 0])
+
+    prefix = "collect_mineral_shards/"
+    assert info[prefix + "sanitization_failed"] is False
+    assert info[prefix + "args_bounds_violation"] is False
+    assert info[prefix + "args_modified"] is False
+    assert info[prefix + "legacy_invalid_or_fallback"] is True
+    assert info[prefix + "sanitized_fn_id"] == POINT_FN_ID
+    assert info[prefix + "fallback_reason_code"] == "fn_unavailable"
+    assert info[prefix + "fallback"] is True
+    assert info[prefix + "requested_screen_flat"] == 0
+    assert info[prefix + "requested_screen_x"] == 0
+    assert info[prefix + "requested_screen_y"] == 0
+    assert info[prefix + "executed_fn_name"] == "no_op"
+    assert prefix + "raster_executed_target_to_neutral_component_distance_estimate_cells" not in info
+
+    low_level = make_env(reject_non_noop=True)
+    low_level.map_name = "CollectMineralShards"
+    low_level._parser.screen = np.zeros((4, 4, 2), dtype=np.float32)
+    _, _, _, _, info = low_level.step([POINT_FN_ID, 0])
+
+    assert info[prefix + "fallback_reason_code"] == "step_error"
+    assert info[prefix + "fallback"] is True
+    assert info[prefix + "args_bounds_violation"] is False
+    assert info[prefix + "legacy_invalid_or_fallback"] is True
+    assert info[prefix + "executed_fn_name"] == "no_op"
+    assert prefix + "raster_requested_target_to_neutral_component_distance_estimate_cells" in info
+    assert prefix + "raster_executed_target_to_neutral_component_distance_estimate_cells" not in info
+
+
+def test_collect_mineral_shards_raster_estimates_use_synthetic_positions():
+    env = PySC2GymEnv.__new__(PySC2GymEnv)
+    before = np.zeros((8, 8, 2), dtype=np.float32)
+    before[1:3, 1:3, 1] = 3
+    before[5:7, 5:7, 1] = 3
+    before[3:5, 2:4, 1] = 1
+    after = np.zeros_like(before)
+    after[5:7, 5:7, 1] = 3
+
+    stats = env._collect_mineral_shards_diagnostics(
+        {"screen": before},
+        {"screen": after},
+        requested_target_cell=(2, 2),
+        executed_target_cell=(6, 6),
+    )
+
+    assert stats["collect_mineral_shards/raster_neutral_component_count_estimate_before"] == 2
+    assert stats["collect_mineral_shards/raster_neutral_component_count_estimate_after"] == 1
+    assert stats[
+        "collect_mineral_shards/raster_requested_target_to_neutral_component_distance_estimate_cells"
+    ] == pytest.approx(2 ** -0.5)
+    assert stats[
+        "collect_mineral_shards/raster_executed_target_to_neutral_component_distance_estimate_cells"
+    ] == pytest.approx(2 ** -0.5)
+    assert stats[
+        "collect_mineral_shards/raster_marine_to_neutral_component_distance_estimate_before_cells"
+    ] > 0
+
+    requested_only = env._collect_mineral_shards_diagnostics(
+        {"screen": before}, {"screen": after}, requested_target_cell=(2, 2)
+    )
+    assert (
+        "collect_mineral_shards/raster_executed_target_to_neutral_component_distance_estimate_cells"
+        not in requested_only
+    )
 
 
 def test_no_op_failure_raises_clear_runtime_error():

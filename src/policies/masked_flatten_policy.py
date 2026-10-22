@@ -12,6 +12,56 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.ppo.policies import MultiInputPolicy
 
 
+class _ResumeTolerantAdam(torch.optim.Adam):
+    """Adam that can restore checkpoints saved before new parameters existed.
+
+    Only the default ``torch.optim.Adam`` is substituted with this class. The
+    padding assumes new parameters are appended after every historical
+    parameter in the same parameter group(s); a refactor that reorders modules
+    would invalidate historical Adam indices. Unsupported layouts fail loudly
+    instead of guessing a mapping.
+    """
+
+    def load_state_dict(self, state_dict):
+        saved_groups = state_dict.get("param_groups", [])
+        if saved_groups and len(saved_groups) != len(self.param_groups):
+            raise ValueError(
+                "_ResumeTolerantAdam cannot resume optimizer state with "
+                f"{len(saved_groups)} parameter groups into "
+                f"{len(self.param_groups)} groups; refusing to guess a mapping."
+            )
+        if saved_groups:
+            saved_lens = [len(group["params"]) for group in saved_groups]
+            current_lens = [len(group["params"]) for group in self.param_groups]
+            if any(s > c for s, c in zip(saved_lens, current_lens)):
+                raise ValueError(
+                    "Saved optimizer has more parameters than the current policy; "
+                    "refusing to guess a mapping."
+                )
+            needs_padding = any(s < c for s, c in zip(saved_lens, current_lens))
+            if needs_padding:
+                state_dict = dict(state_dict)
+                state_dict["param_groups"] = [dict(group) for group in saved_groups]
+                offset = 0
+                for group, saved_len, current_len in zip(
+                    state_dict["param_groups"], saved_lens, current_lens
+                ):
+                    group["params"] = list(group["params"]) + list(
+                        range(offset + saved_len, offset + current_len)
+                    )
+                    offset += current_len
+        return super().load_state_dict(state_dict)
+
+
+def _as_action_tensor(actions, device) -> torch.Tensor:
+    if isinstance(actions, torch.Tensor):
+        return actions.to(device)
+    try:
+        return torch.as_tensor(actions, device=device)
+    except Exception:
+        return torch.tensor(actions, device=device)
+
+
 def _resolve_channel_flags(flags: torch.Tensor, n_channels: int, name: str) -> torch.Tensor:
     """Validate per-channel layer flags and return them as (B, n_channels).
 
@@ -255,6 +305,25 @@ class MaskedFlattenPolicy(MultiInputPolicy):
         # silently excluded from optimization.
         self._build_spatial_heads()
         super()._build(lr_schedule)
+        # The function-conditioned head is appended after every historical
+        # parameter, so optimizer state saved by pre-conditioning checkpoints
+        # keeps its original parameter indices. The optimizer created by
+        # ``super()._build`` is replaced afterwards so the new parameters are
+        # optimized from the first step.
+        self._build_conditioned_heads()
+        self._rebuild_optimizer(lr_schedule)
+
+    def _rebuild_optimizer(self, lr_schedule) -> None:
+        optimizer_class = self.optimizer_class
+        if optimizer_class is torch.optim.Adam:
+            # Only the default Adam gets the append-only resume tolerance.
+            # Custom optimizer classes are used as-is; resuming a
+            # pre-conditioning checkpoint with them may require a compatible
+            # state dict supplied by the caller.
+            optimizer_class = _ResumeTolerantAdam
+        self.optimizer = optimizer_class(
+            self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs
+        )
 
     def _build_spatial_heads(self) -> None:
         """Create spatial action heads eagerly from observation/action spaces."""
@@ -291,6 +360,7 @@ class MaskedFlattenPolicy(MultiInputPolicy):
         # the checkpoint (it is fully derived from the action space).
         n_funcs = int(list(self.action_space.nvec)[0])
         n_slots = len(slot_sizes)
+        self._n_funcs = n_funcs
         fn_slot_mask = torch.zeros((n_funcs, n_slots), dtype=torch.float32)
         for fid, slots in fn_param_map.items():
             for s in slots:
@@ -315,6 +385,7 @@ class MaskedFlattenPolicy(MultiInputPolicy):
             self._screen_spatial_log_scale = nn.Parameter(torch.zeros(()))
         else:
             self._screen_spatial_net = None
+            self._screen_conditional_net = None
             self._screen_in_ch = None
 
         if minimap_in_ch is not None and self._minimap_slot_idx is not None:
@@ -327,7 +398,60 @@ class MaskedFlattenPolicy(MultiInputPolicy):
             self._minimap_spatial_log_scale = nn.Parameter(torch.zeros(()))
         else:
             self._minimap_spatial_net = None
+            self._minimap_conditional_net = None
             self._minimap_in_ch = None
+
+    def _build_conditioned_heads(self) -> None:
+        if hasattr(self, "_function_embedding"):
+            return
+        n_funcs = int(self.action_space.nvec[0])
+        latent_dim = int(self.mlp_extractor.latent_dim_pi)
+        self._fn_embedding_dim = 16
+        self._function_embedding = nn.Embedding(n_funcs, self._fn_embedding_dim)
+        self._argument_conditioner = nn.Sequential(
+            nn.Linear(latent_dim + self._fn_embedding_dim, latent_dim),
+            nn.Tanh(),
+            nn.Linear(latent_dim, sum(self._slot_sizes)),
+        )
+        # Zero-init the residual outputs so checkpoints saved before the
+        # conditional head existed keep exactly their previous behavior when
+        # loaded. The last layer's own gradient is non-zero on the first step,
+        # after which the conditioning path becomes active.
+        nn.init.zeros_(self._argument_conditioner[-1].weight)
+        nn.init.zeros_(self._argument_conditioner[-1].bias)
+        if self._screen_spatial_net is not None:
+            self._screen_conditional_net = nn.Sequential(
+                nn.Conv2d(self._screen_in_ch + self._fn_embedding_dim, 32, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(32, 1, kernel_size=1),
+            )
+            nn.init.zeros_(self._screen_conditional_net[-1].weight)
+            nn.init.zeros_(self._screen_conditional_net[-1].bias)
+        if self._minimap_spatial_net is not None:
+            self._minimap_conditional_net = nn.Sequential(
+                nn.Conv2d(self._minimap_in_ch + self._fn_embedding_dim, 32, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(32, 1, kernel_size=1),
+            )
+            nn.init.zeros_(self._minimap_conditional_net[-1].weight)
+            nn.init.zeros_(self._minimap_conditional_net[-1].bias)
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        """Load pre-conditioning checkpoints with zero-effect initialized additions."""
+        current = self.state_dict()
+        extended = state_dict.copy()
+        new_prefixes = (
+            "_function_embedding.",
+            "_argument_conditioner.",
+            "_screen_conditional_net.",
+            "_minimap_conditional_net.",
+        )
+        for key, value in current.items():
+            if key.startswith(new_prefixes) and key not in extended:
+                extended[key] = value
+        if hasattr(state_dict, "_metadata"):
+            extended._metadata = state_dict._metadata
+        return super().load_state_dict(extended, strict=strict, assign=assign)
 
     @staticmethod
     def _spatial_channels(space):
@@ -339,13 +463,43 @@ class MaskedFlattenPolicy(MultiInputPolicy):
         # observation space is (H, W, C)
         return int(shape[2])
 
+    @staticmethod
+    def _with_no_op_fallback(mask: torch.Tensor) -> torch.Tensor:
+        """Allow ``no_op`` for rows whose available-action mask is all zero.
+
+        PySC2 normally guarantees at least one available action, but a malformed
+        or synthetic all-zero row would otherwise silently become uniform over
+        every PySC2 function (all function logits are masked equally). Sampling,
+        evaluation and entropy must share one support, so replace that
+        degenerate row with the same legal ``no_op`` fallback the env uses.
+        """
+        no_op_id = int(pysc2_actions.FUNCTIONS.no_op.id)
+        if mask.dim() == 0 or mask.shape[-1] <= no_op_id:
+            return mask
+        if mask.dim() == 1:
+            if bool((mask > 0).any()):
+                return mask
+            patched = mask.clone()
+            patched[no_op_id] = 1.0
+            return patched
+        if mask.dim() == 2:
+            empty_rows = (mask > 0).sum(dim=1) == 0
+            if not bool(empty_rows.any()):
+                return mask
+            patched = mask.clone()
+            patched[empty_rows, no_op_id] = 1.0
+            return patched
+        return mask
+
     def _apply_action_mask(self, action_logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         nvec = self.action_space.nvec
         func_dim = int(nvec[0])
         func_logits = action_logits[:, :func_dim]
         rest_logits = action_logits[:, func_dim:]
         # mask==0 -> set logit to large negative
-        mask = mask.to(action_logits.device)
+        if not isinstance(mask, torch.Tensor):
+            mask = torch.as_tensor(mask)
+        mask = self._with_no_op_fallback(mask.to(action_logits.device))
         func_logits = func_logits + (mask <= 0).float() * (-1e9)
         return torch.cat([func_logits, rest_logits], dim=1)
 
@@ -390,6 +544,131 @@ class MaskedFlattenPolicy(MultiInputPolicy):
                         pass
         except Exception:
             pass
+
+    def _condition_argument_logits(
+        self, base_logits, latent_pi, fn_ids, obs, used_slots=None, cache=None
+    ):
+        """Return argument logits conditioned on each sample's selected function.
+
+        ``used_slots``/``cache`` are performance hints for the exact-entropy
+        path: they skip spatial heads that the function never uses and reuse
+        observation features across function branches. Default behavior
+        (both ``None``) is unchanged.
+        """
+        self._build_slot_map_if_needed()
+        sizes = [int(x) for x in self.action_space.nvec]
+        func_dim = sizes[0]
+        safe_fn_ids = fn_ids.to(device=latent_pi.device, dtype=torch.long).clamp(
+            min=0, max=self._n_funcs - 1
+        )
+        embeddings = self._function_embedding(safe_fn_ids)
+        conditioned = torch.cat([latent_pi, embeddings], dim=1)
+        residual = self._argument_conditioner(conditioned)
+        base_args = base_logits[:, func_dim:]
+        logits = torch.cat([base_logits[:, :func_dim], base_args + residual], dim=1)
+        return self._inject_spatial_logits(
+            logits, obs, fn_ids=safe_fn_ids, used_slots=used_slots, cache=cache
+        )
+
+    def _sample_joint_actions(self, base_logits, latent_pi, obs, deterministic=False):
+        sizes = [int(x) for x in self.action_space.nvec]
+        fn_logits = torch.split(base_logits, sizes, dim=1)[0]
+        fn_dist = torch.distributions.Categorical(logits=fn_logits)
+        fn_ids = fn_logits.argmax(dim=1) if deterministic else fn_dist.sample()
+        conditioned = self._condition_argument_logits(base_logits, latent_pi, fn_ids, obs)
+        slot_logits = torch.split(conditioned, sizes, dim=1)[1:]
+        actions = torch.zeros((base_logits.shape[0], len(sizes)), dtype=torch.long, device=base_logits.device)
+        actions[:, 0] = fn_ids
+        used = self._fn_slot_mask[fn_ids]
+        for i, slot_logits_i in enumerate(slot_logits):
+            rows = torch.nonzero(used[:, i] > 0, as_tuple=False).squeeze(1)
+            if rows.numel() == 0:
+                continue
+            if deterministic:
+                values = slot_logits_i[rows].argmax(dim=1)
+            else:
+                values = torch.distributions.Categorical(logits=slot_logits_i[rows]).sample()
+            actions[rows, i + 1] = values
+        return actions, conditioned
+
+    def _conditional_joint_entropy(self, base_logits, latent_pi, obs):
+        """Exact joint conditional entropy of the hierarchical policy.
+
+        The policy factorizes as ``pi(fn|s) * prod_{slot in used(fn)} pi(slot|fn, s)``,
+        so its entropy is
+
+            H(fn|s) + sum_fn pi(fn|s) * sum_{slot in used(fn)} H(slot|fn, s).
+
+        The sum over functions is exact: it runs over the union of functions
+        permitted by ``obs['available_actions']``. Functions excluded by the
+        mask have probability zero after ``_apply_action_mask``, so they cannot
+        contribute. Enumerating that (small) support avoids the prohibitive cost
+        of running one spatial conv pass for all 573 PySC2 functions.
+
+        To keep the enumeration cheap while remaining exact, observation
+        preprocessing and the observation-only base spatial conv are cached
+        once per call, and functions that do not use a spatial slot skip that
+        slot's conditional head. Functions with no arguments are skipped
+        entirely because their argument entropy is zero by definition.
+        """
+        sizes = [int(x) for x in self.action_space.nvec]
+        fn_logits = torch.split(base_logits, sizes, dim=1)[0]
+        fn_logp = F.log_softmax(fn_logits, dim=1)
+        fn_probs = fn_logp.exp()
+        fn_entropy = -(fn_probs * fn_logp).sum(dim=1)
+
+        available = obs.get("available_actions") if isinstance(obs, dict) else None
+        if available is not None:
+            mask = torch.as_tensor(available, device=base_logits.device)
+            # Keep the support identical to sampling/evaluation: an all-zero
+            # row is treated as ``no_op``-only rather than uniformly over all
+            # functions. The function probs below are already masked the same
+            # way, so rows using the fallback contribute zero argument entropy.
+            mask = self._with_no_op_fallback(mask)
+            if mask.dim() == 2:
+                fn_ids = torch.nonzero(mask.any(dim=0), as_tuple=False).squeeze(1)
+            else:
+                fn_ids = torch.nonzero(mask > 0, as_tuple=False).squeeze(1)
+            fn_ids = fn_ids[fn_ids < self._n_funcs]
+            if fn_ids.numel() == 0:
+                fn_ids = torch.arange(self._n_funcs, device=base_logits.device)
+        else:
+            fn_ids = torch.arange(self._n_funcs, device=base_logits.device)
+
+        arg_expectation = torch.zeros_like(fn_entropy)
+        # Observation preprocessing and the base spatial conv do not depend on
+        # the function id, so compute them once and reuse them for every branch.
+        spatial_cache = {}
+        for fn_id in fn_ids.tolist():
+            weight = fn_probs[:, fn_id]
+            if not torch.any(weight > 0):
+                continue
+            fn_slots = self._fn_slot_mask[fn_id]
+            if not bool(fn_slots.any()):
+                # No arguments: this branch contributes no argument entropy.
+                continue
+            branch_ids = torch.full(
+                (base_logits.shape[0],), fn_id, dtype=torch.long, device=base_logits.device
+            )
+            used_slots = torch.nonzero(fn_slots > 0, as_tuple=False).squeeze(1).tolist()
+            conditioned = self._condition_argument_logits(
+                base_logits,
+                latent_pi,
+                branch_ids,
+                obs,
+                used_slots=used_slots,
+                cache=spatial_cache,
+            )
+            slot_logits = torch.split(conditioned, sizes, dim=1)[1:]
+            used = self._fn_slot_mask[branch_ids]
+            branch_entropy = torch.zeros_like(fn_entropy)
+            for slot_idx, slot_logits_i in enumerate(slot_logits):
+                slot_logp = F.log_softmax(slot_logits_i, dim=1)
+                branch_entropy = branch_entropy + (
+                    -(slot_logp.exp() * slot_logp).sum(dim=1) * used[:, slot_idx]
+                )
+            arg_expectation = arg_expectation + weight * branch_entropy
+        return fn_entropy + arg_expectation
 
     def _joint_logprob_and_entropy(self, logits: torch.Tensor, actions: torch.Tensor):
         """Compute joint log_prob and entropy while ignoring unused arg slots per-sample.
@@ -495,11 +774,16 @@ class MaskedFlattenPolicy(MultiInputPolicy):
 
         return total_logp, total_ent
 
-    def _joint_entropy_from_logits(self, logits: torch.Tensor):
-        """Compute per-sample entropy of the joint action distribution given logits.
+    def _joint_entropy_from_logits(self, logits: torch.Tensor, latent_pi=None, obs=None):
+        """Entropy from an already-materialized logits tensor.
 
-        Uses expected slot usage under fn distribution: E[entropy] = H(fn) + sum_i E[used_i] * H(arg_i)
+        Without ``latent_pi``/``obs`` this is the legacy exact formula for a
+        fixed logits tensor: H(fn) + sum_i E[used_i] * H(arg_i). With them, the
+        logits are treated as the base (unconditioned) logits and the result is
+        the exact function-conditioned joint entropy.
         """
+        if latent_pi is not None and obs is not None:
+            return self._conditional_joint_entropy(logits, latent_pi, obs)
         device = logits.device
         self._build_slot_map_if_needed()
         nvec = list(self.action_space.nvec)
@@ -529,178 +813,193 @@ class MaskedFlattenPolicy(MultiInputPolicy):
             total = total + expected_usage[:, i] * ent
         return total
 
-    def _inject_spatial_logits(self, logits: torch.Tensor, obs):
+    def _inject_spatial_logits(self, logits: torch.Tensor, obs, fn_ids=None, used_slots=None, cache=None):
         """Replace flat slot logits with spatial-head logits computed from obs['screen']/['minimap'].
 
         This keeps the external MultiDiscrete action interface but changes how spatial slot
         logits are produced (from a spatial conv map flattened to match slot size).
+        When ``fn_ids`` is given, an additional conv conditioned on the selected
+        function's embedding is added to each spatial map. ``fn_ids=None`` keeps
+        the historical observation-only behavior (used by legacy callers/tests).
+
+        ``used_slots`` optionally restricts which spatial heads are evaluated.
+        Skipped slots retain their flat logits and must be unused by the caller
+        (the conditional entropy path ignores them). ``cache`` optionally reuses
+        preprocessed observations and base spatial maps across per-function
+        passes while keeping the conditional conv per function.
         """
-        import torch
         if not isinstance(logits, torch.Tensor):
             return logits
         device = logits.device
-        sizes = list(self.action_space.nvec)
+        sizes = [int(x) for x in self.action_space.nvec]
         func_dim = int(sizes[0])
         slot_sizes = [int(x) for x in sizes[1:]]
+        used = None if used_slots is None else {int(slot) for slot in used_slots}
 
-        # helper: inject for a single head
-        def _inject(net, slot_idx, in_ch, key, flags_key, log_scale):
-            if net is None or slot_idx is None:
-                return
-            if key not in obs:
-                return
-            x = obs[key]
-            if not isinstance(x, torch.Tensor):
-                x = torch.as_tensor(x, device=device)
-            x = x.float().to(device)
-            if x.dim() != 4:
-                raise ValueError(
-                    f"obs['{key}'] must be 4D (B,H,W,C) or (B,C,H,W), got shape {tuple(x.shape)}"
-                )
-            # accept (B,H,W,C) or (B,C,H,W)
-            if x.shape[-1] == in_ch:
-                x_t = x.permute(0, 3, 1, 2)
-            elif x.shape[1] == in_ch:
-                x_t = x
+        # helper: compute the spatial logits for a single head
+        def _compute(net, conditional_net, slot_idx, in_ch, key, flags_key, log_scale):
+            if net is None or slot_idx is None or key not in obs:
+                return None
+            if used is not None and slot_idx not in used:
+                return None
+            cached = cache.get(key) if cache is not None else None
+            if cached is None:
+                x = obs[key]
+                if not isinstance(x, torch.Tensor):
+                    x = torch.as_tensor(x, device=device)
+                x = x.float().to(device)
+                if x.dim() != 4:
+                    raise ValueError(
+                        f"obs['{key}'] must be 4D (B,H,W,C) or (B,C,H,W), got shape {tuple(x.shape)}"
+                    )
+                # accept (B,H,W,C) or (B,C,H,W)
+                if x.shape[-1] == in_ch:
+                    x_t = x.permute(0, 3, 1, 2)
+                elif x.shape[1] == in_ch:
+                    x_t = x
+                else:
+                    raise ValueError(
+                        f"obs['{key}'] channel count does not match head input: "
+                        f"leading={x.shape[1]}, trailing={x.shape[-1]}, expected {in_ch}"
+                    )
+                flags = obs.get(flags_key)
+                if flags is not None:
+                    if not isinstance(flags, torch.Tensor):
+                        flags = torch.as_tensor(flags, device=device)
+                    flags = _resolve_channel_flags(flags.float().to(device), in_ch, flags_key)
+                    # per-channel layer flags, not an element-wise spatial mask
+                    x_t = x_t * flags[:, :, None, None]
+                base_map = net(x_t)
+                if cache is not None:
+                    cache[key] = (x_t, base_map)
             else:
-                raise ValueError(
-                    f"obs['{key}'] channel count does not match head input: "
-                    f"leading={x.shape[1]}, trailing={x.shape[-1]}, expected {in_ch}"
+                x_t, base_map = cached
+            out_map = base_map
+            if conditional_net is not None and fn_ids is not None:
+                ids = fn_ids.to(device=device, dtype=torch.long)
+                embedding = self._function_embedding(ids)
+                embedding_map = embedding[:, :, None, None].expand(
+                    -1, -1, x_t.shape[2], x_t.shape[3]
                 )
-            flags = obs.get(flags_key)
-            if flags is not None:
-                if not isinstance(flags, torch.Tensor):
-                    flags = torch.as_tensor(flags, device=device)
-                flags = _resolve_channel_flags(flags.float().to(device), in_ch, flags_key)
-                # per-channel layer flags, not an element-wise spatial mask
-                x_t = x_t * flags[:, :, None, None]
-            out_map = net(x_t)  # (B,1,H,W)
-            out_flat = out_map.view(out_map.shape[0], -1)
+                conditioned_map = conditional_net(torch.cat([x_t, embedding_map], dim=1))
+                out_map = base_map + conditioned_map
+            out_flat = out_map.flatten(1)
             if log_scale is not None:
                 # scale = exp(log_scale): positive, differentiable, initialized to 1.
                 out_flat = out_flat * torch.exp(log_scale.clamp(-6.0, 6.0))
             slot_size = slot_sizes[slot_idx]
             if out_flat.shape[1] != slot_size:
-                if out_flat.shape[1] > slot_size:
-                    out_flat = out_flat[:, :slot_size]
-                else:
-                    out_flat = F.pad(out_flat, (0, slot_size - out_flat.shape[1]))
-            start = func_dim + sum(slot_sizes[:slot_idx])
-            end = start + slot_size
-            logits[:, start:end] = out_flat
+                raise ValueError(
+                    f"Spatial logits for '{key}' contain {out_flat.shape[1]} cells, "
+                    f"but the action slot has size {slot_size}."
+                )
+            return out_flat
 
-        _inject(
+        screen_flat = _compute(
             getattr(self, '_screen_spatial_net', None),
+            getattr(self, '_screen_conditional_net', None),
             getattr(self, '_screen_slot_idx', None),
             getattr(self, '_screen_in_ch', None),
             'screen',
             'screen_layer_flags',
             getattr(self, '_screen_spatial_log_scale', None),
         )
-        _inject(
+        minimap_flat = _compute(
             getattr(self, '_minimap_spatial_net', None),
+            getattr(self, '_minimap_conditional_net', None),
             getattr(self, '_minimap_slot_idx', None),
             getattr(self, '_minimap_in_ch', None),
             'minimap',
             'minimap_layer_flags',
             getattr(self, '_minimap_spatial_log_scale', None),
         )
+
+        # Build the result out-of-place: in-place writes into a tensor that is
+        # part of the autograd graph are fragile and unnecessary here.
+        pieces = [logits[:, :func_dim]]
+        cursor = func_dim
+        for slot_idx, slot_size in enumerate(slot_sizes):
+            end = cursor + slot_size
+            if slot_idx == self._screen_slot_idx and screen_flat is not None:
+                pieces.append(screen_flat)
+            elif slot_idx == self._minimap_slot_idx and minimap_flat is not None:
+                pieces.append(minimap_flat)
+            else:
+                pieces.append(logits[:, cursor:end])
+            cursor = end
+        return torch.cat(pieces, dim=1)
+
+    def _base_action_logits(self, latent_pi, obs):
+        logits = self.action_net(latent_pi)
+        if isinstance(self.action_dist, MultiCategoricalDistribution) and "available_actions" in obs:
+            logits = self._apply_action_mask(logits, obs["available_actions"])
         return logits
 
     def _get_masked_distribution(self, obs):
         features = self.extract_features(obs)
         latent_pi, _ = self.mlp_extractor(features)
-        logits = self.action_net(latent_pi)
-        if isinstance(self.action_dist, MultiCategoricalDistribution) and "available_actions" in obs:
-            logits = self._apply_action_mask(logits, obs["available_actions"])
-        # inject spatial logits (screen/minimap) if available
-        logits = self._inject_spatial_logits(logits, obs)
-        base_dist = self.action_dist.proba_distribution(logits)
+        base_logits = self._base_action_logits(latent_pi, obs)
+        policy = self
 
-        # Wrapper to override log_prob and entropy using joint per-slot masking
-        policy_ref = self
-
-        class JointMaskedDistribution:
-            def __init__(self, base, logits, policy):
-                self.base = base
-                self.logits = logits
-                self.policy = policy
+        class ConditionalJointDistribution:
+            def __init__(self):
+                self.logits = base_logits
+                self.latent_pi = latent_pi
+                self.obs = obs
 
             def get_actions(self, deterministic: bool = False):
-                return self.base.get_actions(deterministic=deterministic)
+                actions, _ = policy._sample_joint_actions(
+                    self.logits, self.latent_pi, self.obs, deterministic
+                )
+                return actions
+
+            def sample(self):
+                return self.get_actions(deterministic=False)
+
+            def mode(self):
+                return self.get_actions(deterministic=True)
 
             def log_prob(self, actions):
-                # actions may be numpy or tensor
-                if not isinstance(actions, torch.Tensor):
-                    try:
-                        actions_t = torch.as_tensor(actions, device=self.logits.device)
-                    except Exception:
-                        actions_t = torch.tensor(actions, device=self.logits.device)
-                else:
-                    actions_t = actions.to(self.logits.device)
-                logp, _ = self.policy._joint_logprob_and_entropy(self.logits, actions_t)
-                return logp
+                actions_t = _as_action_tensor(actions, self.logits.device).long()
+                if actions_t.dim() == 1:
+                    actions_t = actions_t.unsqueeze(0)
+                conditioned = policy._condition_argument_logits(
+                    self.logits, self.latent_pi, actions_t[:, 0].long(), self.obs
+                )
+                return policy._joint_logprob_and_entropy(conditioned, actions_t)[0]
 
             def entropy(self):
-                return self.policy._joint_entropy_from_logits(self.logits)
+                # Exact over the available-function support; see _conditional_joint_entropy.
+                return policy._conditional_joint_entropy(self.logits, self.latent_pi, self.obs)
 
-        return JointMaskedDistribution(base_dist, logits, policy_ref)
+        return ConditionalJointDistribution()
 
     def forward(self, obs, deterministic: bool = False):
-        # 1. 特征提取
         features = self.extract_features(obs)
         latent_pi, latent_vf = self.mlp_extractor(features)
         values = self.value_net(latent_vf)
-        logits = self.action_net(latent_pi)
-
-        # 2. 只对第一个头(fn_id)做mask，其他参数槽位严格一一对应
-        if isinstance(self.action_dist, MultiCategoricalDistribution) and "available_actions" in obs:
-            logits = self._apply_action_mask(logits, obs["available_actions"])
-
-        # inject spatial logits (screen/minimap) so flat slots for spatial args come
-        # from spatial conv maps instead of learned flat heads
-        logits = self._inject_spatial_logits(logits, obs)
-
-        # 3. 构造分布并采样，确保每个头只采样唯一语义参数
-        distribution = self.action_dist.proba_distribution(logits)
-        actions = distribution.get_actions(deterministic=deterministic)
-
-        # ensure actions is a tensor on the same device
-        if not isinstance(actions, torch.Tensor):
-            try:
-                actions_t = torch.as_tensor(actions, device=logits.device)
-            except Exception:
-                actions_t = torch.tensor(actions, device=logits.device)
-        else:
-            actions_t = actions.to(logits.device)
-
-        log_prob, _ = self._joint_logprob_and_entropy(logits, actions_t)
+        base_logits = self._base_action_logits(latent_pi, obs)
+        actions, conditioned_logits = self._sample_joint_actions(
+            base_logits, latent_pi, obs, deterministic
+        )
+        log_prob, _ = self._joint_logprob_and_entropy(conditioned_logits, actions)
         return actions, values, log_prob
 
     def get_distribution(self, obs):
         return self._get_masked_distribution(obs)
 
     def evaluate_actions(self, obs, actions):
-        """Ensure train-time log_prob/entropy use the same mask as sampling-time."""
+        """Evaluate the same function-conditioned joint distribution used for sampling."""
         features = self.extract_features(obs)
         latent_pi, latent_vf = self.mlp_extractor(features)
         values = self.value_net(latent_vf)
-
-        logits = self.action_net(latent_pi)
-        if isinstance(self.action_dist, MultiCategoricalDistribution) and "available_actions" in obs:
-            logits = self._apply_action_mask(logits, obs["available_actions"])
-
-        # ensure evaluation uses same injected spatial logits
-        logits = self._inject_spatial_logits(logits, obs)
-
-        # compute joint log_prob and entropy using sample-level mask
-        if not isinstance(actions, torch.Tensor):
-            try:
-                actions_t = torch.as_tensor(actions, device=logits.device)
-            except Exception:
-                actions_t = torch.tensor(actions, device=logits.device)
-        else:
-            actions_t = actions.to(logits.device)
-
-        log_prob, entropy = self._joint_logprob_and_entropy(logits, actions_t)
+        base_logits = self._base_action_logits(latent_pi, obs)
+        actions_t = torch.as_tensor(actions, device=base_logits.device).long()
+        if actions_t.dim() == 1:
+            actions_t = actions_t.unsqueeze(0)
+        conditioned_logits = self._condition_argument_logits(
+            base_logits, latent_pi, actions_t[:, 0].long(), obs
+        )
+        log_prob, _ = self._joint_logprob_and_entropy(conditioned_logits, actions_t)
+        entropy = self._conditional_joint_entropy(base_logits, latent_pi, obs)
         return values, log_prob, entropy
