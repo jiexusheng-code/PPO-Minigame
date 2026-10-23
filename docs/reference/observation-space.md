@@ -2,6 +2,30 @@
 
 本文旨在尽可能详细地介绍 `observation` 观测空间。
 
+## 本项目实际输入（共享视觉策略）
+
+下文列出 PySC2 原始接口；本项目只将以下子集送入策略。七图保持固定形状，通过显式 mask 按图启用，不输入生产队列、分数或 raw 单位列表。
+
+| 地图 | screen 启用层 | minimap 启用层 | vector 启用字段 |
+|---|---|---|---|
+| MoveToBeacon | player_relative, selected | selected | 无 |
+| CollectMineralShards | player_relative, selected | selected | 无 |
+| DefeatRoaches | player_relative, selected, unit_hit_points_ratio | player_relative, selected | army_count |
+| FindAndDefeatZerglings | visibility_map, player_relative, selected, unit_hit_points_ratio | visibility_map, camera, player_relative, selected | army_count |
+| DefeatZerglingsAndBanelings | player_relative, unit_type, selected, unit_hit_points_ratio | player_relative, selected | army_count |
+| CollectMineralsAndGas | player_relative, unit_type, selected, build_progress, buildable, active | selected, buildable | minerals, vespene, food_used, food_cap, food_workers, idle_worker_count |
+| BuildMarines | player_relative, unit_type, selected, build_progress, buildable, active | selected, buildable | minerals, food_used, food_cap, food_workers, idle_worker_count, army_count |
+
+规范层序：
+- screen（8）：visibility_map, player_relative, unit_type, selected, unit_hit_points_ratio, build_progress, buildable, active。
+- minimap（5）：visibility_map, camera, player_relative, selected, buildable。
+- vector（8）：minerals, vespene, food_used, food_cap, food_army, food_workers, idle_worker_count, army_count；数值使用 log1p。
+
+默认空间分辨率为 32×32。禁用层在特征提取时置零，类别 embedding 也受 mask 控制；主分支和空间头均显式接收图层启用标志，区分禁用与真实零值。`pathable` 不纳入输入，minimap `unit_type` 也不使用。
+
+`active` 不携带生产队列内容；screen `build_progress` 不应直接解释为已验证的单位训练进度。`buildable` 提供粗粒度观测，不作为建筑放置合法性掩码。
+
+
 > 记号说明：
 > - `H`/`W` 表示高度/宽度（shape 采用 `(y, x)` 排列），见第3节详细解释
 > - `N` 表示可变长度，含义见每个字段的说明

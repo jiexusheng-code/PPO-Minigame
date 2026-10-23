@@ -1,4 +1,4 @@
-"""Regression tests for eager registration of spatial action heads.
+"""Regression tests for the shared full-resolution spatial policy.
 
 These tests do not launch SC2; they build the policy directly from dummy
 observation/action spaces matching the 32x32 PySC2 mini-game configuration.
@@ -16,11 +16,17 @@ import torch
 
 from pysc2.lib import actions as pysc2_actions
 
-from src.policies.masked_flatten_policy import MaskedFlattenPolicy, VectorLayerNormExtractor
+from src.policies.masked_flatten_policy import (
+    FN_EMBED_DIM,
+    SPATIAL_FEATURE_CHANNELS,
+    MaskedFlattenPolicy,
+    VectorLayerNormExtractor,
+)
 
 SPATIAL_SIZE = 32
-SCREEN_LAYERS = 7
-MINIMAP_LAYERS = 6
+# Canonical ObsParser layer order: screen has 8 layers, minimap has 5.
+SCREEN_LAYERS = 8
+MINIMAP_LAYERS = 5
 VECTOR_DIM = 4
 BATCH_SIZE = 2
 
@@ -69,7 +75,15 @@ def _make_policy():
     )
 
 
-def _make_obs():
+def _default_available():
+    return [
+        pysc2_actions.FUNCTIONS.no_op.id,
+        pysc2_actions.FUNCTIONS.Move_screen.id,
+        pysc2_actions.FUNCTIONS.select_point.id,
+    ]
+
+
+def _make_obs(available=None):
     observation_space, _ = _make_spaces()
     obs = {}
     for key, space in observation_space.spaces.items():
@@ -79,16 +93,38 @@ def _make_obs():
         else:
             obs[key] = torch.ones(BATCH_SIZE, *space.shape)
     obs["available_actions"].zero_()
-    obs["available_actions"][:, pysc2_actions.FUNCTIONS.no_op.id] = 1.0
+    for fn_id in _default_available() if available is None else available:
+        obs["available_actions"][:, fn_id] = 1.0
     return obs
 
 
 def _spatial_named_params(policy):
+    prefixes = (
+        "_screen_spatial_conv.",
+        "_screen_fn_conditioner.",
+        "_screen_spatial_out.",
+        "_minimap_spatial_conv.",
+        "_minimap_fn_conditioner.",
+        "_minimap_spatial_out.",
+        "features_extractor._screen_encoder.",
+        "features_extractor._minimap_encoder.",
+        "features_extractor._screen_fc.",
+        "features_extractor._minimap_fc.",
+    )
     for name, param in policy.named_parameters():
-        if name.startswith("_screen_spatial_net.") or name.startswith("_minimap_spatial_net."):
+        if name.startswith(prefixes):
             yield name, param
-        elif name in ("_screen_spatial_log_scale", "_minimap_spatial_log_scale"):
-            yield name, param
+
+
+def _assert_nonzero_finite_grads(policy, prefixes):
+    params = dict(policy.named_parameters())
+    for name, param in params.items():
+        if not name.startswith(prefixes):
+            continue
+        grad = param.grad
+        assert grad is not None, f"{name} received no gradient"
+        assert torch.isfinite(grad).all(), f"{name} has a non-finite gradient"
+        assert grad.abs().sum() > 0, f"{name} received an all-zero gradient"
 
 
 def test_spatial_heads_registered_before_optimizer_and_receive_gradients():
@@ -100,16 +136,42 @@ def test_spatial_heads_registered_before_optimizer_and_receive_gradients():
     for name, param in spatial_params.items():
         assert id(param) in optimizer_ids, f"{name} is missing from the optimizer parameter groups"
 
-    obs = _make_obs()
-    total_logits = int(sum(policy.action_space.nvec))
-    base_logits = torch.zeros(BATCH_SIZE, total_logits)
-    logits = policy._inject_spatial_logits(base_logits, obs)
-    logits.sum().backward()
+    # A screen-using function forces the shared trunk, projection, and screen head.
+    obs = _make_obs([pysc2_actions.FUNCTIONS.Move_screen.id])
+    actions, values, log_prob = policy(obs, deterministic=True)
+    (log_prob.sum() + values.sum()).backward()
 
-    for name, param in spatial_params.items():
-        assert param.grad is not None, f"{name} received no gradient"
-        assert torch.isfinite(param.grad).all(), f"{name} has a non-finite gradient"
-        assert param.grad.abs().sum() > 0, f"{name} received an all-zero gradient"
+    _assert_nonzero_finite_grads(
+        policy,
+        (
+            "features_extractor._screen_encoder.",
+            "features_extractor._screen_fc.",
+            "_screen_spatial_conv.",
+            "_screen_fn_conditioner.",
+            "_screen_spatial_out.",
+            "_function_embedding.",
+        ),
+    )
+    assert policy._screen_spatial_conv is not None
+    assert policy._minimap_spatial_conv is not None
+
+
+def test_minimap_head_receives_gradients_from_minimap_function():
+    policy = _make_policy()
+    obs = _make_obs([pysc2_actions.FUNCTIONS.Attack_minimap.id])
+    actions, values, log_prob = policy(obs, deterministic=True)
+    (log_prob.sum() + values.sum()).backward()
+    _assert_nonzero_finite_grads(
+        policy,
+        (
+            "features_extractor._minimap_encoder.",
+            "features_extractor._minimap_fc.",
+            "_minimap_spatial_conv.",
+            "_minimap_fn_conditioner.",
+            "_minimap_spatial_out.",
+            "_function_embedding.",
+        ),
+    )
 
 
 def test_cpu_forward_and_evaluate_actions_backward():
@@ -169,42 +231,67 @@ def test_cuda_spatial_heads_follow_policy_device():
         assert torch.isfinite(param.grad).all(), f"{name} has a non-finite gradient on CUDA"
 
 
-def test_spatial_entropy_is_expected_over_function_usage_and_differentiable():
+def test_entropy_is_exact_over_sampled_spatial_slots():
+    torch.manual_seed(0)
     policy = _make_policy()
-    logits = torch.randn(BATCH_SIZE, int(sum(policy.action_space.nvec)), requires_grad=True)
+    available = [
+        pysc2_actions.FUNCTIONS.no_op.id,
+        pysc2_actions.FUNCTIONS.Move_screen.id,
+        pysc2_actions.FUNCTIONS.Attack_minimap.id,
+    ]
+    obs = _make_obs(available)
+    latent, base = _latent_and_base_logits(policy, obs)
     sizes = [int(size) for size in policy.action_space.nvec]
-    fn_logits, *slot_logits = torch.split(logits, sizes, dim=1)
+    fn_logits = torch.split(base, sizes, dim=1)[0]
     fn_probs = torch.softmax(fn_logits, dim=1)
-    fn_entropy = -(fn_probs * torch.log_softmax(fn_logits, dim=1)).sum(dim=1)
-    expected = fn_entropy
-    usage = fn_probs @ policy._fn_slot_mask
-    for i, arg_logits in enumerate(slot_logits):
-        probs = torch.softmax(arg_logits, dim=1)
-        arg_entropy = -(probs * torch.log_softmax(arg_logits, dim=1)).sum(dim=1)
-        expected = expected + usage[:, i] * arg_entropy
+    fn_logp = torch.log_softmax(fn_logits, dim=1)
+    expected = -(fn_probs * fn_logp).sum(dim=1)
+    for fn_id in available:
+        fn_slots = policy._fn_slot_mask[fn_id]
+        used_slots = [slot for slot in policy._sampled_slot_indices if fn_slots[slot] > 0]
+        if not used_slots:
+            continue
+        branch_ids = torch.full((BATCH_SIZE,), fn_id, dtype=torch.long)
+        branch = policy._condition_argument_logits(base, branch_ids, obs)
+        branch_splits = torch.split(branch, sizes, dim=1)[1:]
+        branch_entropy = torch.zeros(BATCH_SIZE)
+        for slot_idx in used_slots:
+            slot_logp = torch.log_softmax(branch_splits[slot_idx], dim=1)
+            branch_entropy = branch_entropy - (slot_logp.exp() * slot_logp).sum(dim=1)
+        expected = expected + fn_probs[:, fn_id] * branch_entropy
 
-    entropy = policy._joint_entropy_from_logits(logits)
+    entropy = policy._conditional_joint_entropy(base, obs)
     torch.testing.assert_close(entropy, expected)
 
-    offsets = torch.cat([torch.full((size,), float(i + 1)) for i, size in enumerate(sizes)])
-    shifted_entropy = policy._joint_entropy_from_logits(logits + offsets)
-    torch.testing.assert_close(shifted_entropy, entropy)
-
     entropy.sum().backward()
-    assert logits.grad is not None and torch.isfinite(logits.grad).all()
+    for name in ("_function_embedding.weight", "_screen_spatial_out.weight"):
+        grad = dict(policy.named_parameters())[name].grad
+        assert grad is not None and torch.isfinite(grad).all()
 
 
-def test_unused_argument_slots_do_not_change_joint_log_prob():
+def test_non_sampled_argument_slots_do_not_change_joint_log_prob():
     policy = _make_policy()
-    logits = torch.randn(BATCH_SIZE, int(sum(policy.action_space.nvec)))
-    actions = torch.zeros(BATCH_SIZE, 1 + len(_param_semantics()), dtype=torch.long)
-    actions[:, 0] = pysc2_actions.FUNCTIONS.no_op.id
-    changed = actions.clone()
-    changed[:, 1:] = torch.tensor([min(1, int(size) - 1) for size in policy.action_space.nvec[1:]])
+    obs = _make_obs([pysc2_actions.FUNCTIONS.select_rect.id])
+    latent, base = _latent_and_base_logits(policy, obs)
+    actions, _, _ = policy(obs, deterministic=True)
+    log_prob, _ = policy._joint_logprob_and_entropy(
+        policy._condition_argument_logits(base, actions[:, 0].long(), obs), actions
+    )
 
-    log_prob, _ = policy._joint_logprob_and_entropy(logits, actions)
-    changed_log_prob, _ = policy._joint_logprob_and_entropy(logits, changed)
-    torch.testing.assert_close(log_prob, changed_log_prob)
+    sizes = [int(x) for x in policy.action_space.nvec]
+    changed = actions.clone()
+    for slot_idx in range(len(sizes) - 1):
+        if slot_idx not in policy._sampled_slot_indices:
+            changed[:, slot_idx + 1] = 1 % sizes[slot_idx + 1]
+    changed_log_prob, _ = policy._joint_logprob_and_entropy(
+        policy._condition_argument_logits(base, changed[:, 0].long(), obs), changed
+    )
+    torch.testing.assert_close(changed_log_prob, log_prob)
+
+    # select_rect: screen2 is a deterministic placeholder, never a sampled corner.
+    screen2_idx = policy._param_semantics.index("screen2")
+    assert changed[:, screen2_idx + 1].abs().sum().item() > 0
+    assert screen2_idx not in policy._sampled_slot_indices
 
 
 def test_spatial_logits_reject_action_slot_dimension_mismatch():
@@ -320,15 +407,6 @@ def test_spatial_layer_flags_change_spatial_logits():
         span = _slot_span(policy, slot_idx)
         assert not torch.allclose(logits_on[:, span], logits_off[:, span])
 
-    # Flags are per-channel and applied before the conv: all-zero flags must
-    # feed an all-zero tensor into the screen conv.
-    screen_span = _slot_span(policy, policy._screen_slot_idx)
-    expected = policy._screen_spatial_net(
-        torch.zeros(BATCH_SIZE, policy._screen_in_ch, SPATIAL_SIZE, SPATIAL_SIZE)
-    ).flatten(1)
-    expected = expected * torch.exp(policy._screen_spatial_log_scale.clamp(-6.0, 6.0))
-    torch.testing.assert_close(logits_off[:, screen_span], expected)
-
 
 def test_spatial_layer_flag_shape_mismatch_raises():
     policy = _make_policy()
@@ -346,8 +424,6 @@ def test_spatial_layer_flag_shape_mismatch_raises():
         policy._inject_spatial_logits(torch.zeros(BATCH_SIZE, total), spatial_mask)
 
 
-
-
 def test_movetobeacon_shapes_forward_with_flags():
     policy = _make_policy()
     actions, values, log_prob = policy(_make_obs())
@@ -358,49 +434,46 @@ def test_movetobeacon_shapes_forward_with_flags():
 
 
 def _latent_and_base_logits(policy, obs):
-    latent, _ = policy.mlp_extractor(policy.extract_features(obs))
+    latent, _, _ = policy._extract_latents(obs)
     return latent, policy._base_action_logits(latent, obs)
 
 
-def test_argument_and_spatial_logits_depend_on_function_and_observation():
+def test_spatial_logits_depend_on_function_and_observation():
     policy = _make_policy()
-    obs = _make_obs()
-    latent, base_logits = _latent_and_base_logits(policy, obs)
+    obs = _make_obs([pysc2_actions.FUNCTIONS.Move_screen.id, pysc2_actions.FUNCTIONS.Attack_screen.id])
+    latent, base = _latent_and_base_logits(policy, obs)
     move_id = pysc2_actions.FUNCTIONS.Move_screen.id
     attack_id = pysc2_actions.FUNCTIONS.Attack_screen.id
-    queued_idx = policy._param_semantics.index("queued")
     screen_span = _slot_span(policy, policy._screen_slot_idx)
-    with torch.no_grad():
-        policy._argument_conditioner[-1].weight.normal_(std=0.01)
-        policy._screen_conditional_net[-1].weight.normal_(std=0.01)
-        policy._screen_conditional_net[-1].bias.normal_(std=0.01)
 
-    move = policy._condition_argument_logits(
-        base_logits, latent, torch.full((BATCH_SIZE,), move_id), obs
-    )
-    attack = policy._condition_argument_logits(
-        base_logits, latent, torch.full((BATCH_SIZE,), attack_id), obs
-    )
+    move = policy._condition_argument_logits(base, torch.full((BATCH_SIZE,), move_id), obs)
+    attack = policy._condition_argument_logits(base, torch.full((BATCH_SIZE,), attack_id), obs)
     assert not torch.allclose(move[:, screen_span], attack[:, screen_span])
-    queued_span = _slot_span(policy, queued_idx)
-    assert not torch.allclose(move[:, queued_span], attack[:, queued_span])
 
+    # The spatial head sees only the spatial trunk + flags + function id, so a
+    # changed screen raster must move its logits ...
     changed_obs = dict(obs)
-    changed_obs["vector"] = obs["vector"].clone()
-    changed_obs["vector"][:, 0] = -2.0
-    changed_latent, changed_base = _latent_and_base_logits(policy, changed_obs)
-    changed = policy._condition_argument_logits(
-        changed_base, changed_latent, torch.full((BATCH_SIZE,), move_id), changed_obs
+    changed_obs["screen"] = obs["screen"].clone()
+    changed_obs["screen"][:, 0, 0, 1] = 3.0
+    changed = policy._condition_argument_logits(base, torch.full((BATCH_SIZE,), move_id), changed_obs)
+    assert not torch.allclose(move[:, screen_span], changed[:, screen_span])
+
+    # ... while the vector only affects the main network, not the spatial head.
+    vector_obs = dict(obs)
+    vector_obs["vector"] = obs["vector"].clone()
+    vector_obs["vector"][:, 0] = -2.0
+    vector_latent, vector_base = _latent_and_base_logits(policy, vector_obs)
+    vector_conditioned = policy._condition_argument_logits(
+        vector_base, torch.full((BATCH_SIZE,), move_id), vector_obs
     )
-    assert not torch.allclose(move[:, queued_span], changed[:, queued_span])
+    assert not torch.allclose(base[:, :policy._n_funcs], vector_base[:, :policy._n_funcs])
+    torch.testing.assert_close(move[:, screen_span], vector_conditioned[:, screen_span])
 
 
 def test_conditional_sampling_evaluation_distribution_and_entropy_match():
     policy = _make_policy()
-    obs = _make_obs()
     point_id = pysc2_actions.FUNCTIONS.select_point.id
-    obs["available_actions"].zero_()
-    obs["available_actions"][:, [pysc2_actions.FUNCTIONS.no_op.id, point_id]] = 1.0
+    obs = _make_obs([pysc2_actions.FUNCTIONS.no_op.id, point_id])
 
     actions, _, forward_logp = policy(obs)
     _, eval_logp, eval_entropy = policy.evaluate_actions(obs, actions)
@@ -414,55 +487,80 @@ def test_conditional_sampling_evaluation_distribution_and_entropy_match():
     torch.testing.assert_close(distribution.log_prob(deterministic_actions), deterministic_logp)
     assert actions.shape == (BATCH_SIZE, len(policy.action_space.nvec))
     for row, fn_id in zip(actions, actions[:, 0].tolist()):
-        active = set(policy._fn_param_map[fn_id])
         for slot_idx in range(len(policy._slot_sizes)):
-            if slot_idx not in active:
+            if slot_idx not in policy._sampled_slot_indices:
                 assert row[slot_idx + 1].item() == 0
+
+
+def test_select_rect_keeps_center_and_zero_screen2_placeholder():
+    policy = _make_policy()
+    rect_id = pysc2_actions.FUNCTIONS.select_rect.id
+    obs = _make_obs([rect_id])
+
+    actions, _, log_prob = policy(obs, deterministic=True)
+    screen_idx = policy._param_semantics.index("screen")
+    screen2_idx = policy._param_semantics.index("screen2")
+    assert (actions[:, 0] == rect_id).all()
+    assert ((actions[:, screen_idx + 1] >= 0) & (actions[:, screen_idx + 1] < SPATIAL_SIZE * SPATIAL_SIZE)).all()
+    assert (actions[:, screen2_idx + 1] == 0).all()
+
+    # Corners are deterministic, so changing the screen2 placeholder must not
+    # change the log probability of the latent center.
+    changed = actions.clone()
+    changed[:, screen2_idx + 1] = 1
+    _, eval_logp, _ = policy.evaluate_actions(obs, actions)
+    _, changed_logp, _ = policy.evaluate_actions(obs, changed)
+    torch.testing.assert_close(eval_logp, changed_logp)
+    torch.testing.assert_close(eval_logp, log_prob)
 
 
 def test_conditional_entropy_exactly_marginalizes_available_functions_and_backpropagates():
     policy = _make_policy()
-    obs = _make_obs()
     no_op_id = pysc2_actions.FUNCTIONS.no_op.id
     point_id = pysc2_actions.FUNCTIONS.select_point.id
-    obs["available_actions"].zero_()
-    obs["available_actions"][:, [no_op_id, point_id]] = 1.0
-    latent, logits = _latent_and_base_logits(policy, obs)
-    fn_logits = torch.full_like(logits[:, :len(pysc2_actions.FUNCTIONS)], -20.0)
-    fn_logits[:, no_op_id] = 0.0
-    fn_logits[:, point_id] = 0.0
-    logits = torch.cat([fn_logits, logits[:, len(pysc2_actions.FUNCTIONS):]], dim=1)
+    obs = _make_obs([no_op_id, point_id])
+    latent, base = _latent_and_base_logits(policy, obs)
 
-    probs = torch.softmax(fn_logits, dim=1)
-    fn_entropy = -(probs * torch.log_softmax(fn_logits, dim=1)).sum(dim=1)
+    probs = torch.softmax(torch.split(base, [int(x) for x in policy.action_space.nvec], dim=1)[0], dim=1)
+    fn_logp = torch.log_softmax(torch.split(base, [int(x) for x in policy.action_space.nvec], dim=1)[0], dim=1)
+    fn_entropy = -(probs * fn_logp).sum(dim=1)
     point_ids = torch.full((BATCH_SIZE,), point_id, dtype=torch.long)
-    point_logits = policy._condition_argument_logits(logits, latent, point_ids, obs)
+    point_logits = policy._condition_argument_logits(base, point_ids, obs)
     point_slots = torch.split(point_logits, [int(size) for size in policy.action_space.nvec], dim=1)[1:]
-    point_entropy = torch.zeros(BATCH_SIZE)
-    for slot_idx in policy._fn_param_map[point_id]:
-        slot_logp = torch.log_softmax(point_slots[slot_idx], dim=1)
-        point_entropy = point_entropy - (slot_logp.exp() * slot_logp).sum(dim=1)
+    screen_idx = policy._param_semantics.index("screen")
+    point_screen_logp = torch.log_softmax(point_slots[screen_idx], dim=1)
+    point_entropy = -(point_screen_logp.exp() * point_screen_logp).sum(dim=1)
     expected = fn_entropy + probs[:, point_id] * point_entropy
 
-    entropy = policy._conditional_joint_entropy(logits, latent, obs)
+    entropy = policy._conditional_joint_entropy(base, obs)
     torch.testing.assert_close(entropy, expected)
     entropy.sum().backward()
-    assert policy._argument_conditioner[-1].weight.grad is not None
-    assert torch.isfinite(policy._argument_conditioner[-1].weight.grad).all()
+    assert policy._screen_spatial_out.weight.grad is not None
+    assert torch.isfinite(policy._screen_spatial_out.weight.grad).all()
 
 
-def test_old_checkpoint_loads_with_zero_effect_conditioning_parameters():
+def test_strict_load_rejects_old_architecture_checkpoint():
     policy = _make_policy()
-    old_keys = ("_function_embedding.", "_argument_conditioner.", "_screen_conditional_net.", "_minimap_conditional_net.")
-    old_state = {key: value.clone() for key, value in policy.state_dict().items() if not key.startswith(old_keys)}
-    loaded = _make_policy()
+    state = {key: value.clone() for key, value in policy.state_dict().items()}
+    # Simulate the previous architecture: no shared-trunk spatial head keys.
+    state.pop("_screen_spatial_conv.weight")
 
-    result = loaded.load_state_dict(old_state, strict=True)
+    with pytest.raises(RuntimeError, match="Missing key"):
+        policy.load_state_dict(state, strict=True)
 
-    assert not result.missing_keys and not result.unexpected_keys
-    obs = _make_obs()
-    latent, base = _latent_and_base_logits(loaded, obs)
-    fn_ids = torch.full((BATCH_SIZE,), pysc2_actions.FUNCTIONS.Move_screen.id)
-    conditioned = loaded._condition_argument_logits(base, latent, fn_ids, obs)
-    legacy = loaded._inject_spatial_logits(base.clone(), obs)
-    torch.testing.assert_close(conditioned, legacy)
+
+def test_shared_trunk_dimensions():
+    policy = _make_policy()
+    extractor = policy.features_extractor
+    assert extractor._screen_encoder is not None
+    assert extractor._minimap_encoder is not None
+    with torch.no_grad():
+        screen_map = extractor.encode_spatial(_make_obs(), "screen")
+        minimap_map = extractor.encode_spatial(_make_obs(), "minimap")
+    assert screen_map.shape == (BATCH_SIZE, SPATIAL_FEATURE_CHANNELS, SPATIAL_SIZE, SPATIAL_SIZE)
+    assert minimap_map.shape == (BATCH_SIZE, SPATIAL_FEATURE_CHANNELS, SPATIAL_SIZE, SPATIAL_SIZE)
+    # Base head input = trunk channels + broadcast layer flags; the function
+    # embedding is added as a channel bias after this convolution.
+    assert policy._screen_spatial_conv.in_channels == SPATIAL_FEATURE_CHANNELS + SCREEN_LAYERS
+    assert policy._minimap_spatial_conv.in_channels == SPATIAL_FEATURE_CHANNELS + MINIMAP_LAYERS
+    assert policy._screen_fn_conditioner.in_features == FN_EMBED_DIM

@@ -12,32 +12,79 @@ from pysc2.lib import features
 
 from src.obs_parser import (
     AVAILABLE_MAPS,
+    BuildMarinesConfig,
     CollectMineralShardsConfig,
+    CollectMineralsAndGasConfig,
+    DefeatRoachesConfig,
+    DefeatZerglingsAndBanelingsConfig,
+    FindAndDefeatZerglingsConfig,
+    MoveToBeaconConfig,
     ObsParser,
 )
 
 
-def test_collect_mineral_shards_is_registered():
-    assert "CollectMineralShards" in AVAILABLE_MAPS
-    assert AVAILABLE_MAPS["CollectMineralShards"] is CollectMineralShardsConfig
+CANONICAL_SCREEN_LAYERS = [
+    "visibility_map",
+    "player_relative",
+    "unit_type",
+    "selected",
+    "unit_hit_points_ratio",
+    "build_progress",
+    "buildable",
+    "active",
+]
+
+CANONICAL_MINIMAP_LAYERS = [
+    "visibility_map",
+    "camera",
+    "player_relative",
+    "selected",
+    "buildable",
+]
+
+# map -> (screen_layer_flags, minimap_layer_flags, vector_mask)
+EXPECTED_CONFIGS = {
+    "MoveToBeacon": (
+        [0, 1, 0, 1, 0, 0, 0, 0],
+        [0, 0, 0, 1, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0],
+    ),
+    "CollectMineralShards": (
+        [0, 1, 0, 1, 0, 0, 0, 0],
+        [0, 0, 0, 1, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0],
+    ),
+    "DefeatRoaches": (
+        [0, 1, 0, 1, 1, 0, 0, 0],
+        [0, 0, 1, 1, 0],
+        [0, 0, 0, 0, 0, 0, 0, 1],
+    ),
+    "FindAndDefeatZerglings": (
+        [1, 1, 0, 1, 1, 0, 0, 0],
+        [1, 1, 1, 1, 0],
+        [0, 0, 0, 0, 0, 0, 0, 1],
+    ),
+    "DefeatZerglingsAndBanelings": (
+        [0, 1, 1, 1, 1, 0, 0, 0],
+        [0, 0, 1, 1, 0],
+        [0, 0, 0, 0, 0, 0, 0, 1],
+    ),
+    "CollectMineralsAndGas": (
+        [0, 1, 1, 1, 0, 1, 1, 1],
+        [0, 0, 0, 1, 1],
+        [1, 1, 1, 1, 0, 1, 1, 0],
+    ),
+    "BuildMarines": (
+        [0, 1, 1, 1, 0, 1, 1, 1],
+        [0, 0, 0, 1, 1],
+        [1, 0, 1, 1, 0, 1, 1, 1],
+    ),
+}
 
 
-def test_collect_mineral_shards_config_uses_minimal_layers():
-    parser = ObsParser("CollectMineralShards")
-
-    assert parser.map_name == "CollectMineralShards"
-    assert parser.config.screen_active_layers == {"player_relative", "selected"}
-    assert parser.config.minimap_active_layers == {"player_relative", "selected"}
-
-    spec = parser.get_output_spec()
-    assert spec["screen"]["shape"] == (32, 32, 7)
-    assert spec["minimap"]["shape"] == (32, 32, 6)
-
-
-def test_collect_mineral_shards_parse_emits_layer_flags():
-    """Synthetic observation only: exercises config gating without SC2."""
-    parser = ObsParser("CollectMineralShards")
-    obs = {
+def _obs():
+    """Synthetic observation; exercises config gating without SC2."""
+    return {
         "player": np.zeros(11, dtype=np.int32),
         "feature_screen": np.zeros(
             (len(features.SCREEN_FEATURES), 64, 64), dtype=np.int32
@@ -48,12 +95,46 @@ def test_collect_mineral_shards_parse_emits_layer_flags():
         "available_actions": np.array([0], dtype=np.int32),
     }
 
-    parsed = parser.parse(obs)
 
-    assert parsed["screen"].shape == (32, 32, 7)
-    assert parsed["minimap"].shape == (32, 32, 6)
-    assert parsed["screen_layer_flags"].tolist() == [0, 1, 0, 1, 0, 0, 0]
-    assert parsed["minimap_layer_flags"].tolist() == [0, 1, 1, 0, 0, 0]
+def test_all_maps_registered():
+    expected_classes = {
+        "MoveToBeacon": MoveToBeaconConfig,
+        "CollectMineralShards": CollectMineralShardsConfig,
+        "DefeatRoaches": DefeatRoachesConfig,
+        "FindAndDefeatZerglings": FindAndDefeatZerglingsConfig,
+        "DefeatZerglingsAndBanelings": DefeatZerglingsAndBanelingsConfig,
+        "CollectMineralsAndGas": CollectMineralsAndGasConfig,
+        "BuildMarines": BuildMarinesConfig,
+    }
+    assert set(AVAILABLE_MAPS) == set(expected_classes)
+    for map_name, cls in expected_classes.items():
+        assert AVAILABLE_MAPS[map_name] is cls
+
+
+@pytest.mark.parametrize("map_name", sorted(EXPECTED_CONFIGS))
+def test_canonical_layer_order_and_shapes(map_name):
+    parser = ObsParser(map_name)
+
+    assert [name for _, name in parser.config.screen_layers] == CANONICAL_SCREEN_LAYERS
+    assert [name for _, name in parser.config.minimap_layers] == CANONICAL_MINIMAP_LAYERS
+
+    spec = parser.get_output_spec()
+    assert spec["screen"]["shape"] == (32, 32, 8)
+    assert spec["minimap"]["shape"] == (32, 32, 5)
+
+
+@pytest.mark.parametrize("map_name", sorted(EXPECTED_CONFIGS))
+def test_parse_emits_expected_flags_and_vector_mask(map_name):
+    parser = ObsParser(map_name)
+    expected_screen, expected_minimap, expected_vector = EXPECTED_CONFIGS[map_name]
+
+    parsed = parser.parse(_obs())
+
+    assert parsed["screen"].shape == (32, 32, 8)
+    assert parsed["minimap"].shape == (32, 32, 5)
+    assert parsed["screen_layer_flags"].tolist() == expected_screen
+    assert parsed["minimap_layer_flags"].tolist() == expected_minimap
+    assert parsed["vector_mask"].tolist() == expected_vector
 
 
 def test_unknown_map_still_rejected():

@@ -7,6 +7,10 @@ import numpy as np
 from src.obs_parser import ObsParser
 from pysc2.lib import features
 
+# select_rect receives a learned center; the environment expands it into a
+# fixed square of this half-size (radius) and clips it to the screen bounds.
+SELECT_RECT_HALF_SIZE = 5
+
 
 class PySC2GymEnv(gym.Env):
     """Generic PySC2 wrapper compatible with Gymnasium."""
@@ -308,6 +312,13 @@ class PySC2GymEnv(gym.Env):
         distinguishes real bounds problems from unavailable functions, missing
         slots, type errors and low-level step failures. The sanitizer rejects
         invalid values rather than silently clipping them.
+
+        For ``select_rect`` the learned ``screen`` value is the rectangle
+        center (a flat index). It is expanded to the fixed
+        ``SELECT_RECT_HALF_SIZE`` square and both corners are clipped to the
+        screen. ``screen2`` is not an independent policy parameter for
+        ``select_rect``: its raw value is ignored and the derived second
+        corner is used instead.
         """
         bounds_violation = False
         try:
@@ -315,33 +326,58 @@ class PySC2GymEnv(gym.Env):
             if fn_id < 0 or fn_id >= len(self.actions.FUNCTIONS):
                 raise ValueError(f"非法fn_id: {fn_id}")
             fn = self.actions.FUNCTIONS[fn_id]
+            fn_name = getattr(fn, "name", "")
             slot_indices = self._fn_param_map.get(fn_id, [])
             args = []
+            select_rect_second_corner = None
             for idx, spec in enumerate(fn.args):
                 name = getattr(spec, "name", "")
                 sizes = getattr(spec, "sizes", []) or []
                 slot = slot_indices[idx] if idx < len(slot_indices) else None
                 if slot is None or slot >= len(param_vec):
                     raise RuntimeError(f"参数槽位缺失: fn_id={fn_id}, 参数{name}, 槽位={slot}")
+
+                if name in self._action_spec_types._fields:
+                    sizes = getattr(self._action_spec_types, name).sizes
+
+                if fn_name == "select_rect" and name == "screen2":
+                    # select_rect's screen2 is not an independent policy
+                    # parameter: its raw value is deliberately ignored and the
+                    # corner is derived from the learned screen center below.
+                    if select_rect_second_corner is None:
+                        raise RuntimeError(
+                            f"select_rect 的 screen2 缺少由 screen 中心推导的角点: fn_id={fn_id}"
+                        )
+                    args.append(list(select_rect_second_corner))
+                    continue
+
                 raw_val = param_vec[slot]
                 try:
                     raw_int = int(raw_val)
                 except Exception:
                     raise RuntimeError(f"参数类型错误: fn_id={fn_id}, 参数{name}, 槽位={slot}, raw_val={raw_val}")
 
-                if name in self._action_spec_types._fields:
-                    sizes = getattr(self._action_spec_types, name).sizes
-                else:
-                    sizes = sizes
-
                 if name in ["minimap", "screen", "screen2"] and len(sizes) >= 2:
-                    h, w = int(sizes[0]), int(sizes[1])
-                    max_flat = h * w
+                    # PySC2 action_spec types report spatial sizes as
+                    # (width, height); flat indices are row-major y*width+x.
+                    width, height = int(sizes[0]), int(sizes[1])
+                    max_flat = width * height
                     if not (0 <= raw_int < max_flat):
                         bounds_violation = True
                         raise ValueError(f"参数越界: fn_id={fn_id}, 参数{name}, 槽位={slot}, raw_val={raw_val}")
-                    y, x = divmod(raw_int, w)
-                    args.append([x, y])
+                    if fn_name == "select_rect" and name == "screen":
+                        # The learned screen value is the rectangle center;
+                        # expand it to a fixed square, clipping both corners.
+                        y, x = divmod(raw_int, width)
+                        x0 = max(0, x - SELECT_RECT_HALF_SIZE)
+                        y0 = max(0, y - SELECT_RECT_HALF_SIZE)
+                        x1 = min(width - 1, x + SELECT_RECT_HALF_SIZE)
+                        y1 = min(height - 1, y + SELECT_RECT_HALF_SIZE)
+                        select_rect_second_corner = (x1, y1)
+                        args.append([x0, y0])
+                    else:
+                        y, x = divmod(raw_int, width)
+                        args.append([x, y])
                 else:
                     size = int(sizes[0]) if len(sizes) > 0 else 1
                     if not (0 <= raw_int < size):
@@ -839,9 +875,14 @@ class PySC2GymEnv(gym.Env):
             )
             executed_target_cell = None
             if not fallback_used and int(exec_fn_id) != int(self.actions.FUNCTIONS.no_op.id):
-                executed_target_cell = self._target_cell_from_args(
-                    executed_arg_names, exec_args, parsed_flat_now, "screen"
-                )
+                if getattr(self.actions.FUNCTIONS[int(exec_fn_id)], "name", "") == "select_rect":
+                    # select_rect executes corners around the learned center;
+                    # report the center so requested/executed stay comparable.
+                    executed_target_cell = requested_target_cell
+                else:
+                    executed_target_cell = self._target_cell_from_args(
+                        executed_arg_names, exec_args, parsed_flat_now, "screen"
+                    )
             info.update(self._collect_mineral_shards_diagnostics(
                 parsed_flat_now,
                 obs,
@@ -851,9 +892,14 @@ class PySC2GymEnv(gym.Env):
             if int(getattr(self, "_vec_env_rank", 0)) == 0:
                 sanitized_target_cell = None
                 if sanitized_ok:
-                    sanitized_target_cell = self._target_cell_from_args(
-                        selected_arg_names, args, parsed_flat_now, "screen"
-                    )
+                    if fn_id is not None and getattr(
+                        self.actions.FUNCTIONS[int(fn_id)], "name", ""
+                    ) == "select_rect":
+                        sanitized_target_cell = requested_target_cell
+                    else:
+                        sanitized_target_cell = self._target_cell_from_args(
+                            selected_arg_names, args, parsed_flat_now, "screen"
+                        )
                 info["collect_mineral_shards/trajectory"] = self._collect_mineral_shards_trajectory(
                     info=info,
                     parsed_before=parsed_flat_now,

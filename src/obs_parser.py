@@ -43,7 +43,7 @@ class MapConfig:
                 "valid": [True, True, True, True, True, True, True, True],
             }
         }
-        # 所有 minigame 统一输出 7 层（canonical 顺序）
+        # 所有 minigame 统一输出 8 层（canonical 顺序）
         self.screen_layers = [
             (features.ScreenFeatures.visibility_map, "visibility_map"),
             (features.ScreenFeatures.player_relative, "player_relative"),
@@ -52,16 +52,16 @@ class MapConfig:
             (features.ScreenFeatures.unit_hit_points_ratio, "unit_hit_points_ratio"),
             (features.ScreenFeatures.build_progress, "build_progress"),
             (features.ScreenFeatures.buildable, "buildable"),
+            (features.ScreenFeatures.active, "active"),
         ]
         # 屏幕特征层实际需要的子集（按 name 标记，None 表示全用）
         self.screen_active_layers = None
         # 小地图特征层选择（canonical 顺序）
         self.minimap_layers = [
             (features.MinimapFeatures.visibility_map, "visibility_map"),
+            (features.MinimapFeatures.camera, "camera"),
             (features.MinimapFeatures.player_relative, "player_relative"),
             (features.MinimapFeatures.selected, "selected"),
-            (features.MinimapFeatures.unit_type, "unit_type"),
-            (features.MinimapFeatures.alerts, "alerts"),
             (features.MinimapFeatures.buildable, "buildable"),
         ]
         # 小地图特征层实际需要的子集（按 name 标记，None 表示全用）
@@ -71,21 +71,36 @@ class MapConfig:
         self.minimap_size = 32
 
 
+# 与 player_vec indices [1..8] 对齐的字段顺序（不得改变）
+_VECTOR_ORDER = [
+    "minerals",
+    "vespene",
+    "food_used",
+    "food_cap",
+    "food_army",
+    "food_workers",
+    "idle_worker_count",
+    "army_count",
+]
+
+
+def _vector_valid(*enabled: str) -> List[bool]:
+    """按 player_vec indices [1..8] 顺序生成逐维有效性列表。"""
+    return [name in enabled for name in _VECTOR_ORDER]
+
 
 class MoveToBeaconConfig(MapConfig):
     """MoveToBeacon 配置（仅需简单观测）"""
-    
+
     def __init__(self):
         super().__init__("MoveToBeacon")
-        
+
         # MoveToBeacon 不需要 player 8 维信息，仅覆盖 valid 置为 False
         # NOTE: 仅支持与 indices 等长的布尔列表/数组（每个维度单独有效/无效）
-        self.vector_fields["player_vec"]["valid"] = [
-            False, False, False, False, False, False, False, False
-        ]
+        self.vector_fields["player_vec"]["valid"] = _vector_valid()
         # 对于 MoveToBeacon，只需要 player_relative、selected 两层
         self.screen_active_layers = {"player_relative", "selected"}
-        self.minimap_active_layers = {"player_relative", "selected"}
+        self.minimap_active_layers = {"selected"}
 
 
 class CollectMineralShardsConfig(MapConfig):
@@ -96,17 +111,47 @@ class CollectMineralShardsConfig(MapConfig):
 
         # 中立碎片与己方单位用 player_relative 即可区分；
         # selected 帮助模型识别当前选中的陆战队员。
+        self.vector_fields["player_vec"]["valid"] = _vector_valid()
         self.screen_active_layers = {"player_relative", "selected"}
-        self.minimap_active_layers = {"player_relative", "selected"}
+        self.minimap_active_layers = {"selected"}
 
 
 class DefeatRoachesConfig(MapConfig):
-    """DefeatRoaches 配置（战斗：需要单位类型与血量）"""
+    """DefeatRoaches 配置（战斗：需要血量）"""
 
     def __init__(self):
         super().__init__("DefeatRoaches")
 
-        self.screen_active_layers = {"player_relative", "unit_type", "selected", "unit_hit_points_ratio"}
+        self.vector_fields["player_vec"]["valid"] = _vector_valid("army_count")
+        self.screen_active_layers = {"player_relative", "selected", "unit_hit_points_ratio"}
+        self.minimap_active_layers = {"player_relative", "selected"}
+
+
+class FindAndDefeatZerglingsConfig(MapConfig):
+    """FindAndDefeatZerglings 配置（战斗：血量 + 视野）"""
+
+    def __init__(self):
+        super().__init__("FindAndDefeatZerglings")
+
+        self.vector_fields["player_vec"]["valid"] = _vector_valid("army_count")
+        self.screen_active_layers = {
+            "player_relative", "selected", "unit_hit_points_ratio", "visibility_map"
+        }
+        self.minimap_active_layers = {
+            "player_relative", "selected", "visibility_map", "camera"
+        }
+
+
+class DefeatZerglingsAndBanelingsConfig(MapConfig):
+    """DefeatZerglingsAndBanelings 配置（战斗：血量 + 单位类型）"""
+
+    def __init__(self):
+        super().__init__("DefeatZerglingsAndBanelings")
+
+        self.vector_fields["player_vec"]["valid"] = _vector_valid("army_count")
+        self.screen_active_layers = {
+            "player_relative", "unit_type", "selected", "unit_hit_points_ratio"
+        }
         self.minimap_active_layers = {"player_relative", "selected"}
 
 
@@ -116,8 +161,15 @@ class CollectMineralsAndGasConfig(MapConfig):
     def __init__(self):
         super().__init__("CollectMineralsAndGas")
 
-        self.screen_active_layers = {"player_relative", "unit_type", "selected"}
-        self.minimap_active_layers = {"player_relative", "selected"}
+        self.vector_fields["player_vec"]["valid"] = _vector_valid(
+            "minerals", "vespene", "food_used", "food_cap",
+            "food_workers", "idle_worker_count",
+        )
+        self.screen_active_layers = {
+            "player_relative", "selected", "unit_type",
+            "build_progress", "buildable", "active",
+        }
+        self.minimap_active_layers = {"selected", "buildable"}
 
 
 class BuildMarinesConfig(MapConfig):
@@ -126,8 +178,15 @@ class BuildMarinesConfig(MapConfig):
     def __init__(self):
         super().__init__("BuildMarines")
 
-        self.screen_active_layers = {"player_relative", "unit_type", "selected", "build_progress"}
-        self.minimap_active_layers = {"player_relative", "selected"}
+        self.vector_fields["player_vec"]["valid"] = _vector_valid(
+            "minerals", "food_used", "food_cap",
+            "food_workers", "idle_worker_count", "army_count",
+        )
+        self.screen_active_layers = {
+            "player_relative", "selected", "unit_type",
+            "build_progress", "buildable", "active",
+        }
+        self.minimap_active_layers = {"selected", "buildable"}
 
 
 # 地图配置映射表
@@ -135,6 +194,8 @@ AVAILABLE_MAPS = {
     "MoveToBeacon": MoveToBeaconConfig,
     "CollectMineralShards": CollectMineralShardsConfig,
     "DefeatRoaches": DefeatRoachesConfig,
+    "FindAndDefeatZerglings": FindAndDefeatZerglingsConfig,
+    "DefeatZerglingsAndBanelings": DefeatZerglingsAndBanelingsConfig,
     "CollectMineralsAndGas": CollectMineralsAndGasConfig,
     "BuildMarines": BuildMarinesConfig,
 }

@@ -8,6 +8,14 @@
 > - ⏳ 等待首次正式训练（5M 步）执行
 > - 尚无正式基准结论
 
+## 本版策略与重新训练
+
+本版采用共享的全分辨率视觉特征、函数条件化的独立 screen/minimap 坐标头，普通非空间动作参数固定为 0；框选由学习的中心点生成固定半径矩形。观测覆盖七张标准 minigame，按已确认的地图 mask 选择 screen 8 层、minimap 5 层与 player 向量 8 项，不添加生产队列。
+
+**本版改变了观测和网络结构，旧 checkpoint 不能直接续训。**正式运行保留 `checkpoint_path` 为空，从头训练；新的功能测试不代表已达到公开参考分数。本次未调整 PPO 超参数，也未为新增两图设定正式训练预算。
+
+逐图输入与动作约定见 [观测空间](docs/reference/observation-space.md#本项目实际输入共享视觉策略) 和 [动作空间](docs/reference/action-space.md#本项目简化策略的动作约定)。
+
 ## 技术栈
 
 - Python 3.10
@@ -147,7 +155,7 @@ $env:TRAIN_CONFIG_PATH="configs/bitahub_first_run.yaml"; uv run python train.py
 
 `save_iters` 同样以 **optimization-step** 为单位：
 
-- 1000（云端正式训练取值）：5M 步下约 19 次保存，单模型约 33MB，合计约 630MB
+- 1000（云端正式训练取值）：5M 步下约 19 次保存；本版在 32×32、`cnn_output_dim: 256` 默认结构下约 1731 万参数，仅 FP32 权重约 66 MiB，含优化器状态的 checkpoint 会更大
 - 较小值：回滚粒度更细，但占用更多磁盘空间
 - 较大值：减少磁盘占用，但回滚粒度粗
 

@@ -1,5 +1,18 @@
 ﻿# Action space in PySC2
 
+## 本项目简化策略的动作约定
+
+以下通用表说明 PySC2 接口，不表示本项目学习所有参数。本版策略保留完整函数集合和外部 MultiDiscrete 槽位，使用 available_actions 屏蔽当前不可用函数，不为每张图硬编码动作白名单。
+
+- 学习动作编号，以及该动作需要的 screen/minimap 坐标；两种坐标各有独立输出，并根据所选动作编号条件化。
+- queued、选择模式、控制组操作/编号、单位索引、卸载/队列索引等普通参数固定为 0，不采样、不计入联合 log-prob 或熵。固定默认值会限制控制能力，这是本版简化的明确取舍。
+- select_rect 的策略 action 中 screen 槽保存学习到的中心点，screen2 固定为 0；环境执行前生成中心点左右上下半径 5 个 screen 像素的矩形，并截断到屏幕边界。
+- PPO rollout 保存中心点；执行给 SC2 的是矩形两角。不能将两角回写成策略采样动作，也不能把 screen2 当作第二个独立随机变量。
+- 空间坐标 flatten 采用 row-major：flat = y * width + x；最终传入 PySC2 的坐标为 [x, y]。
+
+网络使用全分辨率、分别编码的 screen/minimap 共享视觉骨干：各自两层 stride=1 卷积供主网络和对应坐标头复用；图层掩码显式输入空间头。新输入与新网络不支持直接续接旧 checkpoint，需从头训练。
+
+
 **接口类型 (RAW vs FEATURES)**
 
 - **何时使用 RAW**: 需要直接使用世界坐标（`world`）、单位标签（`unit_tags`）或精细的低层控制时使用 RAW 接口。例如需要对原始单位标签或真实世界坐标发出命令，或在研究低级别动作策略时。创建环境时应设置 `AgentInterfaceFormat(use_raw_actions=True, use_raw_units=True)` 或 `action_space=ActionSpace.RAW`；构造动作时请使用 `RAW_FUNCTIONS` 或 `FunctionCall(..., raw=True)`。
@@ -58,9 +71,9 @@ act = actions.FunctionCall(actions.FUNCTIONS.select_point.id, [[0], [x, y]])
 
 | 参数名 | 含义 | dtype | 取值范围 / 说明 |
 |---|---|---|---|
-| `screen` | 屏幕坐标 | `int32` | `[x, y]`，范围由 `action_spec()` 的 `screen` 尺寸决定。在创建环境时通过 `agent_interface_format` 的 `feature_dimensions` 配置（见下）。 |
+| `screen` | 屏幕坐标 | `int32` | `[x, y]`，范围由 `action_spec()` 的 `screen` 尺寸决定。在创建环境时通过 `agent_interface_format` 的 `feature_dimensions` 配置（见下）。注意 `action_spec().types.screen.sizes` 的顺序是 `(width, height)`，而观测数组是 `(height, width)`。 |
 | `minimap` | 小地图坐标 | `int32` | `[x, y]`，范围由 `action_spec()` 的 `minimap` 尺寸决定。通常分辨率低于 `screen`，用于全局操作。 |
-| `screen2` | 第二屏幕坐标（框选） | `int32` | `[x, y]`，范围同 `screen`；用于线性框选的第二个角坐标或其他第二屏幕坐标用途。 |
+| `screen2` | 第二屏幕坐标（框选） | `int32` | `[x, y]`，范围同 `screen`；用于线性框选的第二个角坐标或其他第二屏幕坐标用途。`select_rect` 中它不是独立的策略参数，见开头「本项目简化策略的动作约定」。 |
 | `queued` | 是否排队 | `int32` | `0=now`（立即执行），`1=queued`（加入队列后执行）。 |
 | `control_group_act` | 控制组操作 | `int32` | `0..4`，具体含义见表下方。 |
 | `control_group_id` | 控制组编号 | `int32` | `0..9`（典型为 10 个组）。 |
