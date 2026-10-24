@@ -12,9 +12,11 @@
 
 本版采用共享的全分辨率视觉特征、函数条件化的独立 screen/minimap 坐标头，普通非空间动作参数固定为 0；框选由学习的中心点生成固定半径矩形。观测覆盖七张标准 minigame，按已确认的地图 mask 选择 screen 8 层、minimap 5 层与 player 向量 8 项，不添加生产队列。
 
+送入主 actor/critic 网络的 screen、minimap 视觉投影分别在 ReLU 后增加 LayerNorm，控制特征尺度，降低 critic 的 Tanh 饱和风险；空间坐标头仍使用原来的全分辨率特征。本次不调整观测、动作、奖励或 PPO 超参数，新增诊断口径见 [TensorBoard](docs/reference/tensorboard.md#critic-数值诊断)。
+
 **本版改变了观测和网络结构，旧 checkpoint 不能直接续训。**正式运行保留 `checkpoint_path` 为空，从头训练；新的功能测试不代表已达到公开参考分数。本次未调整 PPO 超参数，也未为新增两图设定正式训练预算。
 
-逐图输入与动作约定见 [观测空间](docs/reference/observation-space.md#本项目实际输入共享视觉策略) 和 [动作空间](docs/reference/action-space.md#本项目简化策略的动作约定)。
+逐图输入与动作约定见 [观测空间](docs/reference/observation-space.md#本项目实际输入共享视觉策略) 和 [动作空间](docs/reference/action-space.md#本项目简化策略的动作约定)。下次排查训练问题时，按 [训练诊断与复盘](docs/reference/debugging.md) 一起保留标量、逐样本诊断与抽样轨迹；不新增运行身份记录。
 
 ## 技术栈
 

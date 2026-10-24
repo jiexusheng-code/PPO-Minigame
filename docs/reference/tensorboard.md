@@ -7,11 +7,30 @@
 `<out_dir>/<timestamp>/tb_logs/` 下的实际目录由写入方决定：
 
 - `extra/`：项目回调 `TBDualWriterCallback` 写入的扩展标量（episode score/length、per-arg 指标等）。
+- `diagnostics/`：周期抽样的 critic 观测、目标和内部数值（数值 NPZ 与 JSON 字段说明）。
+- `trajectories/`：CollectMineralShards 环境 0 周期抽样的完整回合（压缩 JSONL）。
 - `PPO_<n>/`（如 `PPO_1/`）：SB3 内置 TensorBoard writer 写入的主指标（`rollout/*`、`eval/*`、`train/*`、`time/*`），编号由 SB3 自动递增。
 
 当前实现没有单独的 `fundamental/` writer，旧文档或历史计划中提到的 `fundamental/` 目录不会再产生。
 
 [TOC]
+
+## Critic 数值诊断
+
+本版在 `extra/` 增加 critic 诊断，按配置的 `summary_iters` 间隔，在完整 rollout 采集结束、当前轮 PPO 更新之前记录，横轴使用总环境步数。诊断不更新参数。
+
+- `critic/rollout_preupdate/value_*`、`return_*`、`residual_*`：整批 rollout 中预测值、GAE return 及两者残差的统计，包括均值、标准差、极值、有限值比例、相关性和 explained variance。return 是 PPO 训练目标，不是完整回合得分；EV 接近 0 不能单独证明预测恒定。
+- `critic/rollout_preupdate/act/*`：每个 summary 周期基于一批最多 32 条 rollout 观测的 critic 前向，记录视觉编码/投影、critic MLP 各层激活和最终 value 的跨样本统计；各 value Tanh 层另记录 `vf_tanh_layer<序号>_saturated_fraction_sample32_abs_ge_0p999`，以 `abs(output) >= 0.999` 计为饱和。每个周期最多额外前向 32 条观测。
+- `critic/rollout_preupdate/grad_preupdate/*`：首个完整 rollout及之后每累计至少 50,000 环境步保存一次时记录。它是同一批最多 32 条样本上的 value-only MSE 梯度，不包含 actor/entropy loss，也未做 PPO 的全局梯度裁剪；使用 `autograd.grad`，不写入参数 `.grad`。
+- `critic/rollout_preupdate/vf_tanh_saturation_sample_count`：饱和检查使用的实际观测数，最多 32 条，取当前 rollout 按时间和环境索引的均匀间隔样本；不是整个训练分布的全量检查。
+
+统计约定：`*_std_ddof0` 使用总体标准差；有非有限值时，数值统计仅用有限项，并同时记录 `*_finite_fraction`。相关性为 `value_return_corr`；当相关性或 EV 因零方差不可定义时，值记为 0，并用相应的 `*_zero_variance=1` 标明，不能将它当作有效的零相关/零 EV。`act/*/std_across_samples` 表示每个特征在样本间的标准差再对特征取平均，和单条样本内部的 `mean_per_sample_std` 不同。NPZ 的 `act_*` 保存逐样本均值、标准差、绝对最大值和非有限比例，不保存整张中间特征图。
+
+同一周期的逐样本文件保存在 `tb_logs/diagnostics/critic_rollout_step*.npz`，旁边有 `_meta.json` 字段说明。NPZ含schema版本、环境步数/更新序号、采样的时间与环境索引、实际策略观测字段、存储的 value/return/advantage/reward/episode_start、重算 value、选定网络层激活及梯度/参数范数。只包含数值数组，可用 `np.load(path, allow_pickle=False)` 读取。样本在本轮更新前采集，不调用 rollout buffer 的训练生成器，也不更改训练目标。
+
+CollectMineralShards 的 env 0 抽样轨迹保存在 `tb_logs/trajectories/`：记录首个回合，此后按既有 50,000 环境步间隔抽取完整回合。除请求/清理/提交动作及 pre/post 栅格外，还记录原始 feature_units 中 alliance==1 的友军字段、single/multi-select 面板，以及 PySC2 原始观测实际提供的 `last_actions`、`action_result` 等反馈字段和可用性。栅格只保留 CMS 当前启用的离散层（screen 的 player_relative/selected、minimap 的 selected）；被关闭的原始通道不在轨迹中保存。单位行号不是稳定身份，feature_units 的 tag=0 不用于跨帧关联；选择面板不带实体坐标/tag，不能强行匹配单位。`executed` 只表示 wrapper 提交动作且获得 step 返回；没有引擎反馈字段时不推断执行成功。以上仅用于诊断，不作为新增策略输入。
+
+新增 LayerNorm 版本须从头训练，旧模型不能直接续训；这些诊断和离线测试不代表已经达到更高游戏分数。
 
 ## Horizontal axis
 

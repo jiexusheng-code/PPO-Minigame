@@ -651,6 +651,485 @@ class PySC2GymEnv(gym.Env):
             ),
         }
 
+    @staticmethod
+    def _obs_field(observation, name):
+        """Return ``(available, value)`` for a raw observation field.
+
+        PySC2 returns a NamedDict; tests/tools may pass plain objects. A field
+        whose value is ``None`` is treated as absent so a missing raster or
+        engine field is never mistaken for an empty one.
+        """
+        if observation is None:
+            return False, None
+        if isinstance(observation, dict):
+            if observation.get(name) is None:
+                return False, None
+            return True, observation[name]
+        value = getattr(observation, name, None)
+        if value is None:
+            return False, None
+        return True, value
+
+    # ``feature_units`` column mapping: output name -> pysc2 FeatureUnit field.
+    _FEATURE_UNIT_FIELDS = (
+        ("unit_type", "unit_type"),
+        ("alliance", "alliance"),
+        ("screen_x", "x"),
+        ("screen_y", "y"),
+        ("is_selected", "is_selected"),
+        ("health", "health"),
+        ("health_ratio_255", "health_ratio"),
+        ("shield", "shield"),
+        ("shield_ratio_255", "shield_ratio"),
+        ("energy", "energy"),
+        ("energy_ratio_255", "energy_ratio"),
+        ("display_type", "display_type"),
+        ("radius", "radius"),
+        ("is_active", "active"),
+        ("is_on_screen", "is_on_screen"),
+        ("order_length", "order_length"),
+        ("order_id_0", "order_id_0"),
+        ("order_id_1", "order_id_1"),
+        ("tag", "tag"),
+    )
+
+    def _feature_unit_observations(self, observation):
+        """Serialize friendly ``observation.feature_units`` rows as primitives.
+
+        ``feature_units`` is a NamedNumpyArray whose x/y columns are feature
+        screen pixels. Only alliance == 1 (self) rows are recorded; neutral
+        mineral shards are already covered by the canonical raster. PySC2 sets
+        ``tag`` to 0 for feature units (only ``raw_units`` populate it), so row
+        order must not be treated as a stable unit identity.
+        """
+        available, units = self._obs_field(observation, "feature_units")
+        metadata = {
+            "source": (
+                "PySC2 observation.feature_units "
+                "(AgentInterfaceFormat.use_feature_units=True)"
+            ),
+            "coordinate_frame": "feature screen pixels (screen_x/screen_y)",
+            "alliance_codes": {
+                "1": "self",
+                "2": "ally",
+                "3": "neutral",
+                "4": "enemy",
+            },
+            "alliance_filter": (
+                "alliance == 1 (self); neutral shards are covered by the raster"
+            ),
+            "tag_note": (
+                "PySC2 writes tag=0 for every feature_units row; only raw_units "
+                "populate tag. Row order is not a stable unit identity."
+            ),
+            "order_note": (
+                "order_length/order_id_0/order_id_1 are the engine values "
+                "exposed in the feature_units row; id 0 means no order in "
+                "that slot."
+            ),
+            "radius_note": (
+                "recorded as float without further truncation; PySC2 builds "
+                "feature_units as int64, so any fractional radius is already "
+                "truncated upstream."
+            ),
+        }
+        if not available:
+            return {
+                "available": False,
+                "units": None,
+                "count": None,
+                "reason": "observation has no feature_units field",
+                **metadata,
+            }
+        try:
+            array = np.asarray(units)
+        except Exception as exc:
+            return {
+                "available": True,
+                "units": None,
+                "count": None,
+                "reason": f"feature_units is not array-like: {type(exc).__name__}",
+                **metadata,
+            }
+        field_count = len(features.FeatureUnit)
+        if array.ndim != 2 or array.shape[1] < field_count:
+            return {
+                "available": True,
+                "units": None,
+                "count": None,
+                "reason": (
+                    "feature_units has unexpected shape "
+                    f"{tuple(int(v) for v in array.shape)}; expected (n, {field_count})"
+                ),
+                **metadata,
+            }
+        try:
+            alliance = array[:, int(features.FeatureUnit.alliance)]
+            friendly_rows = np.nonzero(alliance == 1)[0]
+        except Exception as exc:
+            return {
+                "available": True,
+                "units": None,
+                "count": None,
+                "reason": f"feature_units filtering failed: {type(exc).__name__}",
+                **metadata,
+            }
+        rows = []
+        for row_index in friendly_rows:
+            row = array[int(row_index)]
+            unit = {}
+            for output_name, feature_name in self._FEATURE_UNIT_FIELDS:
+                try:
+                    value = row[int(getattr(features.FeatureUnit, feature_name))]
+                    # ``radius`` is a continuous FeatureUnit column; truncating
+                    # it to int would misreport sub-pixel sizes.
+                    unit[output_name] = (
+                        self._finite_or_none(float(value))
+                        if output_name == "radius"
+                        else int(value)
+                    )
+                except Exception:
+                    unit[output_name] = None
+            rows.append(unit)
+        return {
+            "available": True,
+            "units": rows,
+            "count": len(rows),
+            **metadata,
+        }
+
+    def _engine_feedback_observations(self, observation):
+        """Record the action feedback SC2 actually exposes in the observation.
+
+        PySC2's ``transform_obs`` exposes ``last_actions`` (function ids from
+        ``obs.actions``) and ``action_result`` (derived from
+        ``obs.action_errors``) when the feature action space is used. It does
+        not expose raw ``action_errors``. An empty ``action_result`` only means
+        no error was reported; it is not an independent engine confirmation.
+        """
+        def field(name, source, note):
+            available, value = self._obs_field(observation, name)
+            entry = {
+                "available": bool(available),
+                "value": None,
+                "source": source,
+                "note": note,
+            }
+            if available:
+                try:
+                    entry["value"] = [
+                        int(item)
+                        for item in np.asarray(value).reshape(-1).tolist()
+                    ]
+                except Exception as exc:
+                    entry["reason"] = (
+                        f"could not serialize field: {type(exc).__name__}"
+                    )
+            return entry
+
+        return {
+            "observation_step": (
+                "post-step raw observation returned by the same SC2Env.step"
+            ),
+            "last_actions": field(
+                "last_actions",
+                "PySC2 transform_obs: obs.actions (function ids)",
+                "Observed by the engine, not an independent execution acknowledgement.",
+            ),
+            "action_result": field(
+                "action_result",
+                "PySC2 transform_obs: derived from obs.action_errors results",
+                "An empty list means no action_errors were reported; it is not "
+                "an engine success confirmation.",
+            ),
+            "action_errors": field(
+                "action_errors",
+                "PySC2 raw protobuf action_errors",
+                "SC2Env does not expose raw action_errors in the returned "
+                "observation; only action_result is available.",
+            ),
+        }
+
+    # ``single_select``/``multi_select`` use the real ``features.UnitLayer``
+    # columns; ``build_progress`` is discretized to 0-100 by transform_obs.
+    _SELECT_PANEL_FIELDS = (
+        ("unit_type", "unit_type"),
+        ("player_relative", "player_relative"),
+        ("health", "health"),
+        ("shields", "shields"),
+        ("energy", "energy"),
+        ("transport_slots_taken", "transport_slots_taken"),
+        ("build_progress_100", "build_progress"),
+    )
+
+    def _select_panel_observations(self, observation):
+        """Serialize the UI single/multi-select panel rows.
+
+        These rows come from ``ui_data``; they carry no coordinates or tags, so
+        they cannot be tied to a ``feature_units`` row without guessing.
+        ``health``/``shields``/``energy`` are raw engine values, not ratios.
+        """
+        result = {
+            "source": (
+                "PySC2 transform_obs: ui_data single/multi unit rows (UnitLayer)"
+            ),
+            "note": (
+                "No coordinates or tags are exposed here; a panel row cannot be "
+                "matched to a feature_units row (e.g. select_unit target id 0) "
+                "without guessing."
+            ),
+        }
+        for name in ("single_select", "multi_select"):
+            available, value = self._obs_field(observation, name)
+            entry = {"available": bool(available), "count": None, "units": None}
+            if available:
+                try:
+                    array = np.asarray(value)
+                except Exception as exc:
+                    entry["reason"] = f"not array-like: {type(exc).__name__}"
+                    result[name] = entry
+                    continue
+                if array.ndim != 2 or array.shape[1] < len(features.UnitLayer):
+                    entry["reason"] = (
+                        "unexpected shape "
+                        f"{tuple(int(v) for v in array.shape)}; "
+                        f"expected (n, {len(features.UnitLayer)})"
+                    )
+                    result[name] = entry
+                    continue
+                rows = []
+                for row in array:
+                    unit = {}
+                    for output_name, layer_name in self._SELECT_PANEL_FIELDS:
+                        try:
+                            unit[output_name] = int(
+                                row[int(getattr(features.UnitLayer, layer_name))]
+                            )
+                        except Exception:
+                            unit[output_name] = None
+                    rows.append(unit)
+                entry["count"] = len(rows)
+                entry["units"] = rows
+            result[name] = entry
+        return result
+
+    def _layer_names(self, layer_attribute):
+        try:
+            config = self._parser.config
+            return [str(name) for _, name in getattr(config, layer_attribute)]
+        except Exception:
+            return []
+
+    def _active_channel_indices(
+        self, parsed, names, flags_key, active_attribute, channel_count=None
+    ):
+        """Resolve which canonical layers the model actually consumed."""
+        if isinstance(parsed, dict):
+            flags = parsed.get(flags_key)
+            if flags is not None:
+                try:
+                    values = np.asarray(flags).reshape(-1)
+                    return [
+                        index
+                        for index, value in enumerate(values)
+                        if float(value) > 0.5
+                    ]
+                except Exception:
+                    pass
+        try:
+            active = getattr(self._parser.config, active_attribute, None)
+        except Exception:
+            active = None
+        if active is not None:
+            wanted = {str(name) for name in active}
+            return [
+                index for index, name in enumerate(names) if name in wanted
+            ]
+        # No flags and no configured active subset: keep every channel present
+        # in the raster so evidence is never silently dropped.
+        count = max(len(names), int(channel_count or 0))
+        return list(range(count))
+
+    @staticmethod
+    def _active_raster(raster, names, indices):
+        """Return the active canonical layers the parser consumed.
+
+        Values are rounded to int64, which is only lossless for the categorical
+        layers CMS enables (``player_relative``/``selected``); this is not a
+        general claim that continuous canonical layers are exact.
+
+        Non-finite cells cannot be represented in an int raster; they are
+        written as 0 for encoding but always counted in ``nonfinite_count`` /
+        ``finite_fraction`` with their coordinates, so an abnormal observation
+        is never silently passed off as a normal raster.
+
+        Inactive zero layers are deliberately omitted: ``channels`` is
+        self-describing and the parser's layer order is preserved.
+        """
+        if raster is None:
+            return {
+                "available": False,
+                "reason": "parsed observation has no raster",
+                "channels": [],
+                "shape": None,
+                "data": None,
+                "nonfinite_count": None,
+                "finite_fraction": None,
+                "nonfinite_coords": None,
+            }
+        try:
+            array = np.asarray(raster)
+        except Exception as exc:
+            return {
+                "available": False,
+                "reason": f"raster is not array-like: {type(exc).__name__}",
+                "channels": [],
+                "shape": None,
+                "data": None,
+                "nonfinite_count": None,
+                "finite_fraction": None,
+                "nonfinite_coords": None,
+            }
+        if array.ndim != 3:
+            return {
+                "available": False,
+                "reason": f"raster has unexpected shape {tuple(int(v) for v in array.shape)}",
+                "channels": [],
+                "shape": [int(v) for v in array.shape],
+                "data": None,
+                "nonfinite_count": None,
+                "finite_fraction": None,
+                "nonfinite_coords": None,
+            }
+        used = [index for index in indices if 0 <= index < array.shape[-1]]
+        channels = [
+            names[index] if index < len(names) else f"channel_{index}"
+            for index in used
+        ]
+        if not used:
+            return {
+                "available": True,
+                "channels": [],
+                "shape": [int(array.shape[0]), int(array.shape[1]), 0],
+                "data_layout": "data[y][x][channel]",
+                "value_encoding": "rounded_to_int64",
+                "data": [],
+                "reason": "no active layers",
+                "nonfinite_count": None,
+                "finite_fraction": None,
+                "nonfinite_coords": None,
+            }
+        values = np.asarray(array[..., used], dtype=np.float64)
+        finite = np.isfinite(values)
+        nonfinite_count = int(values.size - int(finite.sum()))
+        finite_fraction = (
+            float(finite.sum()) / float(values.size) if values.size else None
+        )
+        nonfinite_coords = None
+        if nonfinite_count:
+            ys, xs, cs = np.nonzero(~finite)
+            limit = 32
+            nonfinite_coords = [
+                [int(y), int(x), channels[int(c)]]
+                for y, x, c in zip(ys[:limit], xs[:limit], cs[:limit])
+            ]
+        data = np.rint(np.where(finite, values, 0.0)).astype(np.int64).tolist()
+        return {
+            "available": True,
+            "channels": channels,
+            "shape": [int(array.shape[0]), int(array.shape[1]), len(channels)],
+            "data_layout": "data[y][x][channel]",
+            "value_encoding": "rounded_to_int64",
+            "data": data,
+            "nonfinite_count": nonfinite_count,
+            "finite_fraction": finite_fraction,
+            "nonfinite_coords": nonfinite_coords,
+            "nonfinite_coords_truncated": nonfinite_count > 32,
+        }
+
+    def _trajectory_observation_inputs(self, parsed):
+        """Record the actual parser inputs used for this observation."""
+        parsed = parsed if isinstance(parsed, dict) else {}
+        screen_names = self._layer_names("screen_layers")
+        minimap_names = self._layer_names("minimap_layers")
+
+        def channel_count(raster):
+            try:
+                array = np.asarray(raster)
+                return int(array.shape[-1]) if array.ndim == 3 else None
+            except Exception:
+                return None
+
+        screen_indices = self._active_channel_indices(
+            parsed,
+            screen_names,
+            "screen_layer_flags",
+            "screen_active_layers",
+            channel_count(parsed.get("screen")),
+        )
+        minimap_indices = self._active_channel_indices(
+            parsed,
+            minimap_names,
+            "minimap_layer_flags",
+            "minimap_active_layers",
+            channel_count(parsed.get("minimap")),
+        )
+
+        def float_list(value):
+            if value is None:
+                return None
+            try:
+                return [
+                    self._finite_or_none(item)
+                    for item in np.asarray(value).reshape(-1).tolist()
+                ]
+            except Exception:
+                return None
+
+        def available_ids(value):
+            if value is None:
+                return None
+            try:
+                return [
+                    index
+                    for index, item in enumerate(
+                        np.asarray(value).reshape(-1).tolist()
+                    )
+                    if float(item) > 0.5
+                ]
+            except Exception:
+                return None
+
+        def layer_flags(names, value):
+            if value is None:
+                return None
+            try:
+                values = [
+                    int(round(float(item)))
+                    for item in np.asarray(value).reshape(-1).tolist()
+                ]
+            except Exception:
+                return None
+            return {"names": list(names), "values": values}
+
+        return {
+            "vector": float_list(parsed.get("vector")),
+            "vector_mask": float_list(parsed.get("vector_mask")),
+            "available_fn_ids": available_ids(parsed.get("available_actions")),
+            "screen_layer_flags": layer_flags(
+                screen_names, parsed.get("screen_layer_flags")
+            ),
+            "minimap_layer_flags": layer_flags(
+                minimap_names, parsed.get("minimap_layer_flags")
+            ),
+            "screen_active_layers": self._active_raster(
+                parsed.get("screen"), screen_names, screen_indices
+            ),
+            "minimap_active_layers": self._active_raster(
+                parsed.get("minimap"), minimap_names, minimap_indices
+            ),
+        }
+
     def _collect_mineral_shards_trajectory(
         self,
         info,
@@ -667,16 +1146,31 @@ class PySC2GymEnv(gym.Env):
         sanitized_target_cell,
         executed_target_cell,
         episode_step,
+        raw_before=None,
+        raw_after=None,
     ):
         """Build one compact, JSON-safe step payload for trajectory sampling."""
         prefix = "collect_mineral_shards/"
         relative_ch, selected_ch = self._canonical_screen_channels()
 
-        def _raster(parsed):
+        def _raster(parsed, raw_observation):
             screen = parsed.get("screen") if isinstance(parsed, dict) else None
             if screen is None:
-                return {"marines_raster_estimate": [], "neutral_shards_raster_estimate": []}
-            return self._raster_unit_estimates(screen, relative_ch, selected_ch)
+                estimates = {
+                    "marines_raster_estimate": [],
+                    "neutral_shards_raster_estimate": [],
+                }
+            else:
+                estimates = self._raster_unit_estimates(
+                    screen, relative_ch, selected_ch
+                )
+            return {
+                **estimates,
+                # Evidence from the raw observation, not a new policy input.
+                "feature_units": self._feature_unit_observations(raw_observation),
+                "select_panel": self._select_panel_observations(raw_observation),
+                "observation_inputs": self._trajectory_observation_inputs(parsed),
+            }
 
         def _distance(key):
             return self._finite_or_none(info.get(prefix + key))
@@ -721,11 +1215,35 @@ class PySC2GymEnv(gym.Env):
                     "raster_marine_to_neutral_component_distance_estimate_before_cells"
                 ),
             },
+            "observation_sources": {
+                "pre": (
+                    "parser output of the raw observation the action was chosen from"
+                ),
+                "post": (
+                    "parser output of the post-step observation returned by the "
+                    "same SC2Env.step (not a VecEnv auto-reset observation)"
+                ),
+                "raster": (
+                    "active canonical parser layers only; inactive layers omitted; "
+                    "values rounded to int64, which is only lossless for the "
+                    "categorical layers CMS enables (player_relative/selected); "
+                    "non-finite cells are encoded as 0 and flagged by "
+                    "nonfinite_count/finite_fraction"
+                ),
+                "feature_units": (
+                    "PySC2 observation.feature_units, alliance==1 rows only"
+                ),
+                "select_panel": (
+                    "PySC2 transform_obs single_select/multi_select UnitLayer "
+                    "rows; no coordinates or tags"
+                ),
+            },
+            "engine_feedback": self._engine_feedback_observations(raw_after),
             # ``pre`` is the raster the action was chosen from; ``post`` is the
             # terminal/next timestep returned by the same step. Neither is
             # taken from a VecEnv auto-reset observation.
-            "pre": _raster(parsed_before),
-            "post": _raster(parsed_after),
+            "pre": _raster(parsed_before, raw_before),
+            "post": _raster(parsed_after, raw_after),
         }
 
     def step(self, action) -> tuple:
@@ -915,6 +1433,8 @@ class PySC2GymEnv(gym.Env):
                     sanitized_target_cell=sanitized_target_cell,
                     executed_target_cell=executed_target_cell,
                     episode_step=episode_step,
+                    raw_before=obs_raw,
+                    raw_after=self.timestep.observation,
                 )
 
         self.logger.debug(f"Step {self._step_count}")

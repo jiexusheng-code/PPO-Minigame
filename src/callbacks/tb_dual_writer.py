@@ -11,6 +11,8 @@ import numpy as np
 from stable_baselines3.common.callbacks import BaseCallback
 from torch.utils.tensorboard import SummaryWriter
 
+from src.callbacks.critic_diagnostics import CriticDiagnostics
+
 
 # Trajectory sampling is deliberately limited to the first environment and to
 # CollectMineralShards (the wrapper only emits the payload for that map).
@@ -59,6 +61,10 @@ class TBDualWriterCallback(BaseCallback):
         self._traj_steps = 0
         self._traj_reward_sum = 0.0
         self._traj_next_allowed_step = 0
+        # Pre-update critic diagnostics (rollout scales, bounded activation
+        # probe, sampled npz/gradient evidence). Read-only w.r.t. training.
+        self._critic_diag = CriticDiagnostics(base_log_dir)
+        self._diagnostic_map = None
 
     def _safe_add_scalar(self, writer_name: str, writer: Optional[SummaryWriter], tag: str, value: float, step: int):
         try:
@@ -70,7 +76,9 @@ class TBDualWriterCallback(BaseCallback):
             writer.add_scalar(tag, float(value), int(step))
             self._written_scalar_keys.add(k)
         except Exception:
-            pass
+            logging.getLogger(__name__).warning(
+                "scalar 写入失败: %s (step=%s)", tag, step, exc_info=True
+            )
 
     def _dump_logger_scalars(self, logger, writer, step: int, writer_name: str = "env", include_prefixes=None):
         """Write numeric scalars from SB3 logger into provided SummaryWriter."""
@@ -273,6 +281,9 @@ class TBDualWriterCallback(BaseCallback):
             return
         if payload.get("map") != "CollectMineralShards":
             return
+        if payload.get("map"):
+            # Remembered for diagnostic metadata; other maps provide no info.
+            self._diagnostic_map = str(payload.get("map"))
         global_step = int(getattr(self.model, "num_timesteps", 0))
         episode_step = int(payload["episode_step"])
         episode_id = payload.get("episode_id")
@@ -440,6 +451,11 @@ class TBDualWriterCallback(BaseCallback):
             return None
         return None
 
+    def _critic_scalar_sink(self, step: int):
+        return lambda tag, value: self._safe_add_scalar(
+            "opt", self.opt_writer, tag, float(value), int(step)
+        )
+
     def _on_rollout_end(self) -> None:
         if self.opt_writer is not None and self._is_main_process():
             step = int(getattr(self.model, "num_timesteps", 0))
@@ -458,6 +474,28 @@ class TBDualWriterCallback(BaseCallback):
         self._collect_fn_counts.clear()
         self._collect_reason_counts.clear()
         self._collect_diag_steps = 0
+        # Critic diagnostics on the just-collected (pre-update) rollout.
+        # Scalar tags follow write_opt_every; the sparse npz/gradient sample
+        # follows its own 50k-env-step cadence (first rollout always saved).
+        if self._is_main_process():
+            step = int(getattr(self.model, "num_timesteps", 0))
+            write_scalars = (
+                self.opt_writer is not None
+                and (self.opt_step % self.write_opt_every) == 0
+            )
+            try:
+                self._critic_diag.on_rollout_end(
+                    model=self.model,
+                    step=step,
+                    write_scalars=write_scalars,
+                    emit=self._critic_scalar_sink(step),
+                    map_name=self._diagnostic_map,
+                    opt_step=self.opt_step,
+                )
+            except Exception:
+                logging.getLogger(__name__).warning(
+                    "critic rollout 诊断写入失败，本 rollout 跳过", exc_info=True
+                )
         # write optimization-step per-arg stats (if provided by policy)
         try:
             policy = getattr(self.model, "policy", None)

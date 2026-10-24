@@ -214,6 +214,8 @@ class VectorLayerNormExtractor(BaseFeaturesExtractor):
             nn.Flatten(),
             nn.Linear(SPATIAL_FEATURE_CHANNELS * h * w, cnn_output_dim),
             nn.ReLU(),
+            # Control the main-network input scale to reduce critic Tanh saturation.
+            nn.LayerNorm(cnn_output_dim),
         )
         return encoder, fc
 
